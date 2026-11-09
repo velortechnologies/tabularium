@@ -117,6 +117,8 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const [saveError, setSaveError] = useState<string | null>(null);
     const [saving, setSaving] = useState(false);
     const [editLoading, setEditLoading] = useState(false);
+    const [downloading, setDownloading] = useState(false);
+    const [downloadError, setDownloadError] = useState<string | null>(null);
     const [copied, setCopied] = useState(false);
     const [copyFailed, setCopyFailed] = useState(false);
     useEffect(() => { setCopyFailed(false); setCopied(false); }, [pathLabel]);
@@ -351,6 +353,28 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       }
     }, [pathLabel, saving, editLoading, onPreviewContentSynced]);
 
+    const downloadDocument = useCallback(async () => {
+      if (!pathLabel || downloading) return;
+      setDownloading(true);
+      setDownloadError(null);
+      try {
+        const doc = await getDocument(pathLabel);
+        const blob = new Blob([doc.content], { type: "application/octet-stream" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = pathLabel.split("/").pop() || "document";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (e) {
+        setDownloadError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setDownloading(false);
+      }
+    }, [pathLabel, downloading]);
+
     const cancelEdit = useCallback(() => {
       setEditMode(false);
       setSaveError(null);
@@ -492,6 +516,17 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   {editLoading ? "Loading…" : "Edit"}
                 </button>
               )}
+              <button
+                type="button"
+                className={styles.rawToggle}
+                data-testid="preview-download"
+                title="Download document"
+                aria-label="Download document"
+                disabled={loading || downloading || editMode}
+                onClick={() => { void downloadDocument(); }}
+              >
+                ⇩
+              </button>
             </div>
           ) : null}
         </div>
@@ -507,6 +542,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
             </div>
           ) : null}
           {error ? <p className={styles.err}>{error}</p> : null}
+          {downloadError ? <p className={styles.err} role="alert">{downloadError}</p> : null}
           {editPrepareError && !editMode ? (
             <p className={styles.saveErr} data-testid="preview-edit-load-error">
               {editPrepareError}
