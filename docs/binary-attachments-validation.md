@@ -64,3 +64,13 @@ Video seeking in a real browser is not covered by the live smoke.
 Range behavior is covered by HTTP tests.
 The existing 32 MiB RPC JSON limit remains; the streamed content route has no
 application upload limit. No production deployment, release or version bump.
+
+## Follow-up: download button and real photo
+
+Removed the duplicate inline Download link. Uploaded an owner-requested selfie
+frame as `/binary-smoke-20261111/kira-selfie.jpg`. Rebuilt and deployed the UI/server.
+Selenium on .71 authenticated via cookie, loaded the actual image, confirmed
+no lower Download link, clicked the toolbar download button and compared the
+saved JPEG byte-for-byte (SHA-256
+`1c26bdd7f6ece6e904899d88558b358f948bf25f356ea6e8b59636fcb026527b`).
+Test script on .71: `/root/tb-migration-20261111/check-download.py`.

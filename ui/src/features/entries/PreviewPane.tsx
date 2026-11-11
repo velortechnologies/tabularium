@@ -593,7 +593,6 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                 !mediaFailed && ["video/mp4","video/webm"].includes(mimeType ?? "") ?
                 <video src={mediaUrl} controls preload="metadata" style={{maxWidth:"100%",maxHeight:"90%",objectFit:"contain"}} onError={() => setMediaFailed(true)} /> :
                 <strong>Binary attachment</strong>}
-              <a href={mediaUrl} download={pathLabel?.split("/").pop()}>Download</a>
             </div>
           ) : null}
           {showPreviewBody && rawMode ? (
