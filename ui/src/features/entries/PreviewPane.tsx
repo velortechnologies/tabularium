@@ -592,6 +592,8 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                 <img src={mediaUrl} alt={pathLabel ?? "Attachment"} style={{maxWidth:"100%",maxHeight:"90%",objectFit:"contain"}} onError={() => setMediaFailed(true)} /> :
                 !mediaFailed && ["video/mp4","video/webm"].includes(mimeType ?? "") ?
                 <video src={mediaUrl} controls preload="metadata" style={{maxWidth:"100%",maxHeight:"90%",objectFit:"contain"}} onError={() => setMediaFailed(true)} /> :
+                !mediaFailed && ["audio/ogg","audio/opus","audio/mpeg","audio/mp4","audio/wav","audio/x-wav","audio/webm","audio/flac"].includes(mimeType ?? "") ?
+                <audio src={mediaUrl} controls preload="metadata" style={{width:"min(100%, 480px)"}} onError={() => setMediaFailed(true)} /> :
                 <strong>Binary attachment</strong>}
             </div>
           ) : null}

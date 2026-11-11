@@ -60,8 +60,8 @@ installation failure is explicit, not an indefinitely retrying snap bootstrap.
 
 ## Scope still not independently exercised
 
-Video seeking in a real browser is not covered by the live smoke.
-Range behavior is covered by HTTP tests.
+Video playback and seeking were subsequently covered by the authenticated
+audio/video smoke below. Range behavior is covered by HTTP tests.
 The existing 32 MiB RPC JSON limit remains; the streamed content route has no
 application upload limit. No production deployment, release or version bump.
 
@@ -74,3 +74,16 @@ no lower Download link, clicked the toolbar download button and compared the
 saved JPEG byte-for-byte (SHA-256
 `1c26bdd7f6ece6e904899d88558b358f948bf25f356ea6e8b59636fcb026527b`).
 Test script on .71: `/root/tb-migration-20261111/check-download.py`.
+
+
+## Audio/video follow-up
+
+Added native audio controls for Ogg/Opus, MP3, MP4 audio, WAV, WebM audio and
+FLAC; the content route serves these audio types inline. No autoplay.
+Retained owner-authorized test entries: voice-smoke.ogg (1.66 seconds,
+Telegram archive message 1714166, connection-check phrase) and
+kira-selfie-video.mp4 (5 seconds), under /binary-smoke-20261111.
+Authenticated Chrome check verified metadata load, initially paused controls,
+playback clock advancement, seek/resume and HTTP 206 inline reads for both.
+Script: .71 /root/tb-migration-20261111/check-av.py.
+CI includes generated WAV playback/seek alongside the tall/wide PNG tests.

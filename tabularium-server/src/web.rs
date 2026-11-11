@@ -2062,7 +2062,20 @@ async fn rest_get_content(
     let mime = meta.mime_type().unwrap_or("application/octet-stream");
     let inline = matches!(
         mime,
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4" | "video/webm"
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "video/mp4"
+            | "video/webm"
+            | "audio/ogg"
+            | "audio/opus"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/wav"
+            | "audio/x-wav"
+            | "audio/webm"
+            | "audio/flac"
     );
     let mut response = Response::builder()
         .status(status)
