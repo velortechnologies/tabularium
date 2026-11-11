@@ -305,6 +305,14 @@ struct PathContentCreate {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct BinaryWrite {
+    path: String,
+    content_base64: String,
+    mime_type: Option<String>,
+    only_if_revision: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct PathContentForce {
     path: String,
     content: String,
@@ -597,6 +605,27 @@ impl TabulariumMcp {
             json!({"path":p.path,"metadata":p.metadata,"only_if_revision":p.only_if_revision}),
         )
         .await
+    }
+
+    #[tool(description = "Read binary bytes as Base64. Prefer HTTP content route for large files.")]
+    async fn get_binary(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<PathArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(&parts, "get_binary", json!({"path":p.path}))
+            .await
+    }
+
+    #[tool(
+        description = "Create or replace a binary entry from Base64, with optional revision precondition."
+    )]
+    async fn put_binary(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<BinaryWrite>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(&parts,"put_binary",json!({"path":p.path,"content_base64":p.content_base64,"mime_type":p.mime_type,"only_if_revision":p.only_if_revision})).await
     }
 
     #[tool(description = "Read full document body and metadata (JSON-RPC get_document).")]

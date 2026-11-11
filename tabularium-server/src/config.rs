@@ -102,6 +102,8 @@ pub struct ServerSection {
     /// `host:port`, e.g. `127.0.0.1:3050`.
     pub listen: String,
     pub database_path: std::path::PathBuf,
+    #[serde(default)]
+    pub blob_root: Option<std::path::PathBuf>,
     pub index_dir: std::path::PathBuf,
     /// Tokio worker threads; `0` means `available_parallelism()`.
     pub workers: u32,

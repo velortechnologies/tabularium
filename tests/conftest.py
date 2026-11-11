@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import pytest
 
 # Selenium Web UI tests MUST target this host only (Enginseer doctrine — no loopback).
-SELENIUM_TEST_HOST = "10.90.1.102"
+SELENIUM_TEST_HOST = "10.90.1.71"
 
 
 def pytest_configure(config) -> None:
@@ -92,7 +92,7 @@ def _create_selenium_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     if os.environ.get("CI") or os.environ.get("TABULARIUM_CI"):
-        for chrome_bin in ("/usr/bin/chromium-browser", "/usr/bin/chromium"):
+        for chrome_bin in (os.environ.get("CHROME_BINARY", ""), "/usr/bin/chromium", "/usr/bin/chromium-browser"):
             if os.path.isfile(chrome_bin):
                 options.binary_location = chrome_bin
                 break

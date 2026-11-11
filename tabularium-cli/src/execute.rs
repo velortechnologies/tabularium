@@ -2053,7 +2053,13 @@ async fn import_document_with_metadata(
     } else {
         None
     };
-    client.create_document(path, content).await?;
+    let _ = content;
+    let mime = if source.extension().is_none() && std::fs::read_to_string(source).is_err() {
+        Some("application/octet-stream")
+    } else {
+        None
+    };
+    client.upload_file(path, source, mime).await?;
     if let Some(metadata) = metadata {
         client.set_document_metadata(path, &metadata, None).await?;
     }
@@ -2106,7 +2112,7 @@ async fn import_fs_subtree(
                 any_error = true;
                 continue;
             }
-            match std::fs::read_to_string(&path) {
+            match Ok::<String, std::io::Error>(String::new()) {
                 Ok(content) => {
                     match import_document_with_metadata(client, &tb_path, &content, &path).await {
                         Ok(_) => {
@@ -2185,8 +2191,7 @@ async fn cmd_import(
                 .to_string()
         };
         validate_entity_name(&fname).map_err(|e| -> BoxErr { format!("import: {e}").into() })?;
-        let content = std::fs::read_to_string(dir)
-            .map_err(|e| -> BoxErr { format!("import: {e}").into() })?;
+        let content = String::new();
         if directory == "/" {
             let tb_path = join_abs_dir_entry("/", &fname);
             import_document_with_metadata(client, &tb_path, &content, dir).await?;
@@ -2261,34 +2266,28 @@ async fn export_one_file(client: &Client, tb_path: &str, out_path: &Path) -> Res
     let metadata = snapshot
         .get("metadata")
         .ok_or("missing metadata in response")?;
-    match client.get_document(tb_path).await {
-        Ok(body) => match std::fs::write(out_path, body.content().as_bytes()) {
-            Ok(()) => {
-                if metadata.as_object().is_some_and(|m| !m.is_empty()) {
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&sidecar)?;
-                    file.write_all((serde_json::to_string_pretty(metadata)? + "\n").as_bytes())?;
-                }
-                println!("{} - OK", out_path.display());
-                match server_entry_modified_at(client, tb_path).await {
-                    Ok(ts) => {
-                        if let Err(e) = apply_fs_mtime_from_timestamp(out_path, ts) {
-                            println!("{} - ERROR: {e}", out_path.display());
-                            err = true;
-                        }
+    match client.download_file(tb_path, out_path).await {
+        Ok(()) => {
+            if metadata.as_object().is_some_and(|m| !m.is_empty()) {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&sidecar)?;
+                file.write_all((serde_json::to_string_pretty(metadata)? + "\n").as_bytes())?;
+            }
+            println!("{} - OK", out_path.display());
+            match server_entry_modified_at(client, tb_path).await {
+                Ok(ts) => {
+                    if let Err(e) = apply_fs_mtime_from_timestamp(out_path, ts) {
+                        println!("{} - ERROR: {e}", out_path.display());
+                        err = true;
                     }
-                    Err(e) => println!("{tb_path} - WARNING: mtime: {e}"),
                 }
+                Err(e) => println!("{tb_path} - WARNING: mtime: {e}"),
             }
-            Err(e) => {
-                println!("{} - ERROR: {e}", out_path.display());
-                err = true;
-            }
-        },
+        }
         Err(e) => {
-            println!("{tb_path} - ERROR: {e}");
+            println!("{} - ERROR: {e}", out_path.display());
             err = true;
         }
     }

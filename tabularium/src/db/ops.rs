@@ -517,9 +517,7 @@ impl<S: Storage> Database<S> {
                     "cp: cannot copy a file onto itself".into(),
                 ));
             }
-            let body = self.get_document(fid).await?;
-            self.put_document_by_path(&dst_file, &body, true, None)
-                .await?;
+            self.copy_file_content(fid, &dst_file).await?;
             self.set_document_metadata(&dst_file, &self.storage.file_metadata(fid).await?, None)
                 .await?;
             return Ok(());
@@ -572,9 +570,7 @@ impl<S: Storage> Database<S> {
                         .storage
                         .resolve_path(&src_child, Some(EntryKind::File))
                         .await?;
-                    let body = self.get_document(fid).await?;
-                    self.put_document_by_path(&dst_child, &body, true, None)
-                        .await?;
+                    self.copy_file_content(fid, &dst_child).await?;
                     self.set_document_metadata(
                         &dst_child,
                         &self.storage.file_metadata(fid).await?,

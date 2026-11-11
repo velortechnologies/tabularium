@@ -10,7 +10,8 @@ export async function verifyPskWithServer(psk: string): Promise<VerifyPskResult>
     return { ok: false, message: "Enter a pre-shared key." };
   }
   try {
-    const r = await fetch("/api/whoami", {
+    const r = await fetch("/api/session/login", {
+      method: "POST",
       headers: { "X-Auth-Key": trimmed },
     });
     if (r.ok) {

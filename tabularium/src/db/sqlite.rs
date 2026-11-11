@@ -158,10 +158,39 @@ async fn ensure_metadata_column(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Add binary metadata without rewriting existing content, timestamps or revisions.
+/// blob_revision is independent: metadata edits and moves bump entry revision.
+async fn ensure_binary_columns(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (name, ddl) in [
+        (
+            "content_kind",
+            "ALTER TABLE entries ADD COLUMN content_kind INTEGER NOT NULL DEFAULT 0 CHECK(content_kind IN (0, 1))",
+        ),
+        ("sha256", "ALTER TABLE entries ADD COLUMN sha256 TEXT"),
+        (
+            "blob_revision",
+            "ALTER TABLE entries ADD COLUMN blob_revision TEXT",
+        ),
+    ] {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = ?")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+        if n == 0 {
+            sqlx::query(ddl).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn migrate(pool: &SqlitePool) -> Result<()> {
     if table_exists(pool, "entries").await? {
         ensure_revision_column(pool).await?;
         ensure_metadata_column(pool).await?;
+        ensure_binary_columns(pool).await?;
         ensure_acl_tables(pool).await?;
         ensure_access_keys_named_schema(pool).await?;
         return Ok(());
@@ -204,6 +233,7 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     .bind(now)
     .execute(pool)
     .await?;
+    ensure_binary_columns(pool).await?;
     ensure_acl_tables(pool).await?;
     ensure_access_keys_named_schema(pool).await?;
     Ok(())
@@ -212,9 +242,43 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
 /// SQLite implementation of [`Storage`].
 pub struct SqliteStorage {
     pool: SqlitePool,
+    blobs: super::blob::BlobStore,
 }
 
 impl SqliteStorage {
+    pub fn set_blob_root(&mut self, root: std::path::PathBuf) {
+        self.blobs = super::blob::BlobStore::new(root);
+    }
+    pub fn new_binary_upload(&self) -> Result<tempfile::NamedTempFile> {
+        self.blobs.temporary()
+    }
+    pub async fn create_browser_session(&self, key: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let result = sqlx::query("INSERT INTO browser_sessions (token_hash, psk_id) SELECT ?, id FROM access_keys WHERE key = ?")
+            .bind(hash).bind(key).execute(&self.pool).await?;
+        if result.rows_affected() != 1 {
+            return Err(Error::Unauthorized("unknown key".into()));
+        }
+        Ok(token)
+    }
+    pub async fn browser_session_acl(&self, token: &str) -> Result<Option<String>> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        Ok(sqlx::query_scalar("SELECT a.name FROM browser_sessions s JOIN access_keys p ON p.id = s.psk_id JOIN acls a ON a.id = p.acl_id WHERE s.token_hash = ?")
+            .bind(hash).fetch_optional(&self.pool).await?)
+    }
+    pub async fn delete_browser_session(&self, token: &str) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        sqlx::query("DELETE FROM browser_sessions WHERE token_hash = ?")
+            .bind(hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Connects (creating the database file if needed) and applies DDL.
     #[instrument(name = "sqlite_storage_connect", fields(db_uri = db_uri.as_ref()), err(Debug))]
     pub async fn connect(db_uri: impl AsRef<str>) -> Result<Self> {
@@ -224,12 +288,31 @@ impl SqliteStorage {
             .map_err(|e| Error::InvalidInput(e.to_string()))?
             .create_if_missing(true)
             .foreign_keys(true);
+        let blob_root = opts.get_filename().with_extension("blobs");
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts)
             .await?;
         migrate(&pool).await?;
-        Ok(Self { pool })
+        sqlx::query("CREATE TABLE IF NOT EXISTS browser_sessions (token_hash TEXT PRIMARY KEY, psk_id INTEGER NOT NULL REFERENCES access_keys(id) ON DELETE CASCADE)")
+            .execute(&pool).await?;
+        Ok(Self {
+            pool,
+            blobs: super::blob::BlobStore::new(blob_root),
+        })
+    }
+
+    async fn text_write_failure(&self, file_id: EntryId) -> Result<()> {
+        let kind: Option<i64> =
+            sqlx::query_scalar("SELECT content_kind FROM entries WHERE id = ? AND kind = 1")
+                .bind(file_id.raw())
+                .fetch_optional(&self.pool)
+                .await?;
+        match kind {
+            Some(1) => Err(Error::BinaryEntry(file_id.to_string())),
+            Some(_) => Err(Error::RevisionMismatch(file_id.to_string())),
+            None => Err(Error::NotFound(file_id.to_string())),
+        }
     }
 
     fn map_sqlite_constraint(err: sqlx::Error) -> Error {
@@ -461,26 +544,6 @@ async fn canonical_path_for_id(pool: &SqlitePool, entry_id: EntryId) -> Result<S
     Ok(format!("/{}", parts.join("/")))
 }
 
-async fn subtree_ids_deepest_first(pool: &SqlitePool, root_id: i64) -> Result<Vec<i64>> {
-    sqlx::query_scalar(
-        r"
-        WITH RECURSIVE sub AS (
-            SELECT id, 0 AS depth FROM entries WHERE id = ?
-            UNION ALL
-            SELECT e.id, sub.depth + 1
-            FROM entries e
-            JOIN sub ON e.parent_id = sub.id
-            WHERE e.id != e.parent_id
-        )
-        SELECT id FROM sub ORDER BY depth DESC
-        ",
-    )
-    .bind(root_id)
-    .fetch_all(pool)
-    .await
-    .map_err(Into::into)
-}
-
 async fn recursive_file_count_under(pool: &SqlitePool, dir_id: i64) -> Result<u64> {
     let n: i64 = sqlx::query_scalar(
         r"
@@ -512,7 +575,8 @@ fn row_to_file_meta(row: &SqliteRow, canonical_path: String) -> Result<DocumentM
         row.try_get::<Option<String>, _>(6)?,
         row.try_get::<i64, _>(7)?,
     )
-    .with_mime_type(row.try_get::<Option<String>, _>(8)?))
+    .with_mime_type(row.try_get::<Option<String>, _>(8)?)
+    .with_binary_metadata(row.try_get::<i64, _>(9)? as u8, row.try_get(10)?))
 }
 
 #[derive(Clone, Copy)]
@@ -523,6 +587,118 @@ enum MkdirParentsScan {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn replace_binary_with_text(
+        &self,
+        file_id: EntryId,
+        content: &str,
+        mime: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let old: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT revision, blob_revision FROM entries WHERE id = ? AND kind = 1")
+                .bind(file_id.raw())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((revision, generation)) = old else {
+            return Err(Error::NotFound(file_id.to_string()));
+        };
+        if expected_revision == Some("*") {
+            return Err(Error::Duplicate(file_id.to_string()));
+        }
+        if expected_revision.is_some_and(|v| Some(v) != revision.as_deref()) {
+            return Err(Error::RevisionMismatch(file_id.to_string()));
+        }
+        let size = i64::try_from(content.len())
+            .map_err(|_| Error::InvalidInput("size overflow".into()))?;
+        sqlx::query("UPDATE entries SET content_kind = 0, content = ?, size = ?, mime_type = ?, sha256 = NULL, blob_revision = NULL, revision = ?, modified_at = ? WHERE id = ?")
+            .bind(content).bind(size).bind(mime).bind(new_file_revision()).bind(Timestamp::now()).bind(file_id.raw())
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        if let Some(generation) = generation {
+            self.blobs.remove(file_id, &generation)?;
+        }
+        Ok(())
+    }
+
+    fn new_binary_upload(&self) -> Result<tempfile::NamedTempFile> {
+        self.blobs.temporary()
+    }
+    async fn put_binary_file(
+        &self,
+        path: &str,
+        temporary: &std::path::Path,
+        mime: &str,
+        size: i64,
+        sha256: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<EntryId> {
+        let (parent, name) = parent_and_final_name(path)?;
+        let parent_id = self.resolve_path(&parent, Some(EntryKind::Dir)).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let old: Option<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, kind, revision, blob_revision FROM entries WHERE parent_id = ? AND name = ?")
+            .bind(parent_id.raw()).bind(&name).fetch_optional(&mut *tx).await?;
+        let revision = new_file_revision();
+        let now = Timestamp::now();
+        let (id, old_generation) = if let Some((id, kind, old_revision, old_generation)) = old {
+            if expected_revision == Some("*") {
+                return Err(Error::Duplicate(path.into()));
+            }
+            if kind != 1 {
+                return Err(Error::Duplicate(path.into()));
+            }
+            if expected_revision.is_some_and(|expected| Some(expected) != old_revision.as_deref()) {
+                return Err(Error::RevisionMismatch(path.into()));
+            }
+            (id, old_generation)
+        } else {
+            if expected_revision.is_some_and(|r| r != "*") {
+                return Err(Error::NotFound(path.into()));
+            }
+            let id: i64 = sqlx::query_scalar("INSERT INTO entries (parent_id, kind, name, content, size, created_at, modified_at, accessed_at, revision) VALUES (?, 1, ?, '', 0, ?, ?, ?, ?) RETURNING id")
+                .bind(parent_id.raw()).bind(&name).bind(now).bind(now).bind(now).bind(&revision)
+                .fetch_one(&mut *tx).await?;
+            (id, None)
+        };
+        self.blobs.publish(temporary, id.into(), &revision)?;
+        let result = sqlx::query("UPDATE entries SET content_kind = 1, content = '', mime_type = ?, size = ?, sha256 = ?, blob_revision = ?, revision = ?, modified_at = ? WHERE id = ?")
+            .bind(mime).bind(size).bind(sha256).bind(&revision).bind(&revision).bind(now).bind(id)
+            .execute(&mut *tx).await;
+        if let Err(e) = result {
+            tx.rollback().await?;
+            self.blobs.remove(id.into(), &revision)?;
+            return Err(e.into());
+        }
+        // On uncertain commit failure retain the new generation; never remove a potentially live blob.
+        tx.commit().await?;
+        if let Some(old) = old_generation {
+            self.blobs.remove(id.into(), &old)?;
+        }
+        Ok(id.into())
+    }
+
+    async fn open_binary_file(&self, file_id: EntryId) -> Result<(DocumentMeta, std::fs::File)> {
+        // Serialize open with replacement/delete until the OS file handle is acquired.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let generation: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT blob_revision FROM entries WHERE id = ? AND content_kind = 1",
+        )
+        .bind(file_id.raw())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let generation = generation
+            .flatten()
+            .ok_or_else(|| Error::NotFound(file_id.to_string()))?;
+        let row = sqlx::query("SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256 FROM entries WHERE id = ?")
+            .bind(file_id.raw()).fetch_one(&mut *tx).await?;
+        let file = std::fs::File::open(self.blobs.path(file_id, &generation)?)?;
+        let path = canonical_path_for_id(&self.pool, file_id).await?;
+        let meta = row_to_file_meta(&row, path)?;
+        tx.commit().await?;
+        Ok((meta, file))
+    }
+
     async fn file_metadata(&self, file_id: EntryId) -> Result<serde_json::Value> {
         let raw: Option<String> =
             sqlx::query_scalar("SELECT metadata_json FROM entries WHERE id = ? AND kind = 1")
@@ -719,15 +895,28 @@ impl Storage for SqliteStorage {
         if id.raw() == ROOT_ID {
             return Err(Error::InvalidInput("cannot delete root".into()));
         }
-        let ids = subtree_ids_deepest_first(&self.pool, id.raw()).await?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ids: Vec<i64> = sqlx::query_scalar("WITH RECURSIVE sub AS (SELECT id, 0 AS depth FROM entries WHERE id = ? UNION ALL SELECT e.id, sub.depth + 1 FROM entries e JOIN sub ON e.parent_id = sub.id WHERE e.id != e.parent_id) SELECT id FROM sub ORDER BY depth DESC")
+            .bind(id.raw()).fetch_all(&mut *tx).await?;
+        let mut blobs = Vec::new();
         for eid in ids {
+            let generation: Option<String> =
+                sqlx::query_scalar("SELECT blob_revision FROM entries WHERE id = ?")
+                    .bind(eid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if let Some(generation) = generation {
+                blobs.push((eid, generation));
+            }
             sqlx::query("DELETE FROM entries WHERE id = ?")
                 .bind(eid)
                 .execute(&mut *tx)
                 .await?;
         }
         tx.commit().await?;
+        for (id, generation) in blobs {
+            self.blobs.remove(id.into(), &generation)?;
+        }
         Ok(())
     }
 
@@ -790,12 +979,22 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn delete_file(&self, file_id: EntryId) -> Result<()> {
-        let r = sqlx::query("DELETE FROM entries WHERE id = ? AND kind = 1")
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let generation: Option<Option<String>> =
+            sqlx::query_scalar("SELECT blob_revision FROM entries WHERE id = ? AND kind = 1")
+                .bind(file_id.raw())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(generation) = generation else {
+            return Err(Error::NotFound(file_id.to_string()));
+        };
+        sqlx::query("DELETE FROM entries WHERE id = ?")
             .bind(file_id.raw())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        if r.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("file {}", file_id.raw())));
+        tx.commit().await?;
+        if let Some(generation) = generation {
+            self.blobs.remove(file_id, &generation)?;
         }
         Ok(())
     }
@@ -811,7 +1010,7 @@ impl Storage for SqliteStorage {
         let size = i64::try_from(new_content.as_ref().len())
             .map_err(|_| Error::InvalidInput("file content size overflow".into()))?;
         let r = sqlx::query(
-            "UPDATE entries SET content = ?, size = ?, modified_at = ?, revision = ? WHERE id = ? AND kind = 1",
+            "UPDATE entries SET content = ?, size = ?, modified_at = ?, revision = ? WHERE id = ? AND kind = 1 AND content_kind = 0",
         )
         .bind(new_content.as_ref())
         .bind(size)
@@ -821,7 +1020,7 @@ impl Storage for SqliteStorage {
         .execute(&self.pool)
         .await?;
         if r.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("file {}", file_id.raw())));
+            return self.text_write_failure(file_id).await;
         }
         Ok(())
     }
@@ -838,7 +1037,7 @@ impl Storage for SqliteStorage {
         let size = i64::try_from(new_content.as_ref().len())
             .map_err(|_| Error::InvalidInput("file content size overflow".into()))?;
         let r = sqlx::query(
-            "UPDATE entries SET content = ?, size = ?, modified_at = ?, revision = ? WHERE id = ? AND kind = 1 AND revision = ?",
+            "UPDATE entries SET content = ?, size = ?, modified_at = ?, revision = ? WHERE id = ? AND kind = 1 AND content_kind = 0 AND revision = ?",
         )
         .bind(new_content.as_ref())
         .bind(size)
@@ -851,15 +1050,7 @@ impl Storage for SqliteStorage {
         if r.rows_affected() > 0 {
             return Ok(());
         }
-        let exists: Option<String> =
-            sqlx::query_scalar("SELECT revision FROM entries WHERE id = ? AND kind = 1")
-                .bind(file_id.raw())
-                .fetch_optional(&self.pool)
-                .await?;
-        match exists {
-            None => Err(Error::NotFound(format!("file {}", file_id.raw()))),
-            Some(_) => Err(Error::RevisionMismatch(format!("file {}", file_id.raw()))),
-        }
+        self.text_write_failure(file_id).await
     }
 
     #[instrument(skip(self, to_append), fields(file_id = file_id.raw()), err(Debug))]
@@ -873,7 +1064,7 @@ impl Storage for SqliteStorage {
                 modified_at = ?,
                 revision = ?,
                 size = length(content || CASE WHEN substr(content, -1) = char(10) THEN '' ELSE char(10) END || ?)
-            WHERE id = ? AND kind = 1",
+            WHERE id = ? AND kind = 1 AND content_kind = 0",
         )
         .bind(piece)
         .bind(now)
@@ -883,7 +1074,7 @@ impl Storage for SqliteStorage {
         .execute(&self.pool)
         .await?;
         if r.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("file {}", file_id.raw())));
+            return self.text_write_failure(file_id).await;
         }
         Ok(())
     }
@@ -981,13 +1172,16 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn get_file_content(&self, file_id: EntryId) -> Result<String> {
-        let row = sqlx::query_scalar::<_, String>(
-            "SELECT content FROM entries WHERE id = ? AND kind = 1",
-        )
-        .bind(file_id.raw())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.ok_or_else(|| Error::NotFound(format!("file {}", file_id.raw())))
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT content_kind, content FROM entries WHERE id = ? AND kind = 1")
+                .bind(file_id.raw())
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((0, content)) => Ok(content),
+            Some(_) => Err(Error::BinaryEntry(file_id.to_string())),
+            None => Err(Error::NotFound(file_id.to_string())),
+        }
     }
 
     #[instrument(skip(self), fields(dir_path = %dir_path), err(Debug))]
@@ -1039,7 +1233,7 @@ impl Storage for SqliteStorage {
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn get_file_meta(&self, file_id: EntryId) -> Result<DocumentMeta> {
         let row = sqlx::query(
-            r"SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type
+            r"SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256
             FROM entries WHERE id = ? AND kind = 1",
         )
         .bind(file_id.raw())
@@ -1298,6 +1492,154 @@ impl Storage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn binary_lifecycle_replace_move_metadata_and_delete() {
+        use crate::db::Storage;
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = super::SqliteStorage::connect(format!(
+            "sqlite://{}",
+            dir.path().join("blobs.db").display()
+        ))
+        .await
+        .unwrap();
+        storage
+            .create_directory("/media", None, false)
+            .await
+            .unwrap();
+        let temp = dir.path().join("upload");
+        std::fs::write(&temp, [0, 255, 1]).unwrap();
+        let id = storage
+            .put_binary_file("/media/a.png", &temp, "image/png", 3, "test-hash", None)
+            .await
+            .unwrap();
+        let (meta, mut old_reader) = storage.open_binary_file(id).await.unwrap();
+        assert!(meta.is_binary());
+        storage.set_file_metadata(id, "{}", None).await.unwrap();
+        storage.rename_file(id, "renamed.png").await.unwrap();
+        let (renamed, _) = storage.open_binary_file(id).await.unwrap();
+        assert_eq!(renamed.canonical_path(), "/media/renamed.png");
+        std::fs::write(&temp, [9, 8]).unwrap();
+        assert!(matches!(
+            storage
+                .put_binary_file(
+                    "/media/renamed.png",
+                    &temp,
+                    "image/png",
+                    2,
+                    "new-hash",
+                    meta.revision()
+                )
+                .await,
+            Err(crate::Error::RevisionMismatch(_))
+        ));
+        storage
+            .put_binary_file(
+                "/media/renamed.png",
+                &temp,
+                "image/png",
+                2,
+                "new-hash",
+                renamed.revision(),
+            )
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        old_reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, [0, 255, 1]);
+        let (_, mut new_reader) = storage.open_binary_file(id).await.unwrap();
+        bytes.clear();
+        new_reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, [9, 8]);
+        storage.delete_directory_recursive("/media").await.unwrap();
+        assert!(storage.open_binary_file(id).await.is_err());
+        let leaf = dir.path().join("blobs.blobs/000/000");
+        assert_eq!(std::fs::read_dir(leaf).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn binary_text_operations_fail_without_changing_revision_or_size() {
+        use crate::db::Storage;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = super::SqliteStorage::connect(format!(
+            "sqlite://{}",
+            dir.path().join("guard.db").display()
+        ))
+        .await
+        .unwrap();
+        let id = storage.create_file("/picture.png", "").await.unwrap();
+        sqlx::query("UPDATE entries SET content_kind = 1, size = 123 WHERE id = ?")
+            .bind(id.raw())
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        let before = storage.get_file_meta(id).await.unwrap();
+        assert!(matches!(
+            storage.get_file_content(id).await,
+            Err(crate::Error::BinaryEntry(_))
+        ));
+        assert!(matches!(
+            storage.update_file(id, "corrupt").await,
+            Err(crate::Error::BinaryEntry(_))
+        ));
+        assert!(matches!(
+            storage.append_file(id, "corrupt").await,
+            Err(crate::Error::BinaryEntry(_))
+        ));
+        assert!(matches!(
+            storage
+                .update_file_if_revision_matches(id, "corrupt", before.revision().unwrap())
+                .await,
+            Err(crate::Error::BinaryEntry(_))
+        ));
+        let after = storage.get_file_meta(id).await.unwrap();
+        assert_eq!(before.revision(), after.revision());
+        assert_eq!(after.size_bytes(), 123);
+    }
+
+    #[tokio::test]
+    async fn binary_upgrade_preserves_legacy_rows_and_is_repeatable() {
+        use crate::db::Storage;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!(
+            "sqlite://{}",
+            dir.path().join("binary-upgrade.db").display()
+        );
+        let storage = super::SqliteStorage::connect(&uri).await.unwrap();
+        let id = storage
+            .create_file("/legacy.md", "unchanged UTF-8: пташка")
+            .await
+            .unwrap();
+        let before = storage.get_file_meta(id).await.unwrap();
+        for name in ["content_kind", "sha256", "blob_revision"] {
+            sqlx::query(&format!("ALTER TABLE entries DROP COLUMN {name}"))
+                .execute(&storage.pool)
+                .await
+                .unwrap();
+        }
+        super::migrate(&storage.pool).await.unwrap();
+        super::migrate(&storage.pool).await.unwrap();
+        assert_eq!(
+            storage.get_file_content(id).await.unwrap(),
+            "unchanged UTF-8: пташка"
+        );
+        let after = storage.get_file_meta(id).await.unwrap();
+        assert_eq!(before.revision(), after.revision());
+        assert_eq!(before.modified_at(), after.modified_at());
+        let row: (i64, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT content_kind, sha256, blob_revision FROM entries WHERE id = ?")
+                .bind(id.raw())
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (0, None, None));
+        let integrity: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
     #[tokio::test]
     async fn metadata_upgrade_preserves_legacy_rows_and_is_repeatable() {
         let dir = tempfile::tempdir().unwrap();

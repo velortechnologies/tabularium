@@ -266,6 +266,8 @@ pub struct DocumentMeta {
     revision: Option<String>,
     size_bytes: i64,
     mime_type: Option<String>,
+    content_kind: u8,
+    sha256: Option<String>,
 }
 
 impl DocumentMeta {
@@ -292,7 +294,28 @@ impl DocumentMeta {
             revision,
             size_bytes,
             mime_type: None,
+            content_kind: 0,
+            sha256: None,
         }
+    }
+
+    pub fn is_binary(&self) -> bool {
+        self.content_kind == 1
+    }
+    pub fn content_kind(&self) -> &'static str {
+        if self.is_binary() {
+            "binary_attachment"
+        } else {
+            "text"
+        }
+    }
+    pub fn sha256(&self) -> Option<&str> {
+        self.sha256.as_deref()
+    }
+    pub(crate) fn with_binary_metadata(mut self, kind: u8, sha256: Option<String>) -> Self {
+        self.content_kind = kind;
+        self.sha256 = sha256;
+        self
     }
 
     pub(crate) fn with_mime_type(mut self, mime_type: Option<String>) -> Self {

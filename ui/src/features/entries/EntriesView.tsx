@@ -250,6 +250,7 @@ export function EntriesView() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [focusPane, setFocusPane] = useState<"tree" | "preview">("tree");
   const [previewContent, setPreviewContent] = useState<string | null>(null);
+  const [previewBinary, setPreviewBinary] = useState(false);
   const [previewMimeType, setPreviewMimeType] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -589,6 +590,7 @@ export function EntriesView() {
     if (!openDocPath) {
       setPreviewContent(null);
       setPreviewMimeType(null);
+      setPreviewBinary(false);
       setPreviewError(null);
       setPreviewLoading(false);
       return;
@@ -601,6 +603,7 @@ export function EntriesView() {
         const doc = await getDocument(openDocPath);
         if (!cancelled) {
           setPreviewContent(doc.content);
+          setPreviewBinary(doc.content_kind === "binary_attachment");
           setPreviewMimeType(doc.mime_type ?? null);
         }
       } catch (e) {
@@ -1729,6 +1732,7 @@ export function EntriesView() {
               pathLabel={openDocPath}
               content={previewContent}
               mimeType={previewMimeType}
+              binary={previewBinary}
               loading={previewLoading}
               error={previewError}
               highlightQuery={previewHighlightQuery}

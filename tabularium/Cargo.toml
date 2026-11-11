@@ -16,6 +16,8 @@ full = ["db", "client"]
 ## SQLite + Tantivy + `Database` / `SqliteStorage` / search, including optional embeddings HTTP client.
 db = [
     "dep:async-trait",
+    "dep:tempfile",
+    "dep:sha2",
     "dep:reqwest",
     "dep:bma-ts",
     "dep:chrono",
@@ -42,6 +44,8 @@ client = [
 ]
 
 [dependencies]
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
 async-trait = { version = "0.1", optional = true }
 bma-ts = { package = "bma-ts", version = "0.2.6", features = ["chrono", "serde", "sqlx"], optional = true }
 chrono = { version = "0.4", optional = true }
@@ -52,7 +56,7 @@ fs-err = { version = "3", optional = true }
 globset = { version = "0.4", optional = true }
 moka = { version = "0.12", features = ["future"], optional = true }
 regex = { version = "1", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros"], optional = true }

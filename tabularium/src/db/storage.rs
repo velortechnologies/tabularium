@@ -10,6 +10,27 @@ use crate::{Result, Timestamp};
 /// Async persistence for the hierarchical `entries` table (`sqlx` today, another engine tomorrow).
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn replace_binary_with_text(
+        &self,
+        file_id: EntryId,
+        content: &str,
+        mime: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<()>;
+    fn new_binary_upload(&self) -> Result<tempfile::NamedTempFile>;
+    /// Publish an already flushed same-filesystem upload; explicit binary replacement.
+    async fn put_binary_file(
+        &self,
+        path: &str,
+        temporary: &std::path::Path,
+        mime: &str,
+        size: i64,
+        sha256: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<EntryId>;
+    /// Open while holding a read transaction so replacement cannot unlink before open.
+    async fn open_binary_file(&self, file_id: EntryId) -> Result<(DocumentMeta, std::fs::File)>;
+
     /// Arbitrary JSON object, stored independently of document content.
     async fn file_metadata(&self, file_id: EntryId) -> Result<serde_json::Value>;
     async fn set_file_metadata(

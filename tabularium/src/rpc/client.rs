@@ -43,6 +43,75 @@ pub struct Client {
 }
 
 impl Client {
+    fn content_url(&self, path: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/content", self.base))
+            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| Error::InvalidInput("invalid base URL".into()))?;
+            for segment in path.trim_start_matches('/').split('/') {
+                segments.push(segment);
+            }
+        }
+        Ok(url)
+    }
+    pub async fn upload_file(
+        &self,
+        path: &str,
+        source: &std::path::Path,
+        mime: Option<&str>,
+    ) -> Result<()> {
+        let file = tokio::fs::File::open(source).await?;
+        let size = file.metadata().await?.len();
+        let mut request = self
+            .http
+            .put(self.content_url(path)?)
+            .header(reqwest::header::IF_NONE_MATCH, "*")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(file);
+        if let Some(mime) = mime {
+            request = request.header(reqwest::header::CONTENT_TYPE, mime);
+        }
+        let response = request.send().await.map_err(|e| Error::Io(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(Error::InvalidInput(format!(
+                "upload HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+    pub async fn download_file(&self, path: &str, destination: &std::path::Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut response = self
+            .http
+            .get(self.content_url(path)?)
+            .send()
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(Error::InvalidInput(format!(
+                "download HTTP {}",
+                response.status()
+            )));
+        }
+        let mut output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .await?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?
+        {
+            output.write_all(&chunk).await?;
+        }
+        output.flush().await?;
+        Ok(())
+    }
+
     /// `api_uri` is e.g. `http://127.0.0.1:3050` (no trailing slash).
     pub fn init(api_uri: impl Into<String>, timeout: Duration) -> Result<Self> {
         Self::init_with_extra_headers(api_uri, timeout, HeaderMap::new())

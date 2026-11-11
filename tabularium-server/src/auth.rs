@@ -110,6 +110,13 @@ pub(crate) async fn resolve_request_auth(
 
     match peek_x_auth_key(headers) {
         AuthKeyHeader::Absent => {
+            if let Some(token) = session_cookie(headers) {
+                return db
+                    .resolve_browser_session(token)
+                    .await?
+                    .map(RequestAuth::Authenticated)
+                    .ok_or_else(|| Error::Unauthorized("unknown browser session".into()));
+            }
             if let Some(ctx) = anonymous {
                 return Ok(RequestAuth::Authenticated(ctx.clone()));
             }
@@ -143,6 +150,7 @@ pub(crate) fn is_anonymous_auth(
         )
     });
     matches!(auth, RequestAuth::Authenticated(_))
+        && session_cookie(headers).is_none()
         && assertion_absent
         && matches!(peek_x_auth_key(headers), AuthKeyHeader::Absent)
 }
@@ -251,4 +259,13 @@ pub(crate) fn whoami_json(auth: &RequestAuth) -> Value {
         }),
         RequestAuth::Authenticated(ctx) => ctx.whoami_json(),
     }
+}
+
+pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|part| part.trim().strip_prefix("tb_session="))
 }

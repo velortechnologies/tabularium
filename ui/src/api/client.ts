@@ -21,6 +21,7 @@ export interface ListedEntry {
 }
 
 export interface DocumentBody {
+  content_kind?: "text" | "binary_attachment";
   mime_type?: string | null;
   id: number;
   path: string;
@@ -127,7 +128,8 @@ export async function getDocument(apiPath: string): Promise<DocumentBody> {
   if (!r.ok) {
     throw new Error(`get_document failed: ${r.status}`);
   }
-  return (await r.json()) as DocumentBody;
+  const document = (await r.json()) as DocumentBody;
+  return {...document, content: document.content ?? ""};
 }
 
 export async function renameDocument(

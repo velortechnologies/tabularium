@@ -105,6 +105,12 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/api/content/{*rest}",
+            get(rest_get_content).put(rest_put_content),
+        )
+        .route("/api/session/login", post(browser_login))
+        .route("/api/session/logout", post(browser_logout))
         .route("/api/test", get(api_test))
         .route("/api/whoami", get(api_whoami))
         .route("/api/doc", get(list_root).post(rest_mkdir))
@@ -124,7 +130,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reindex", post(rest_reindex))
         .route("/ws", get(ws_upgrade))
         .route("/rpc", post(rpc_dispatch))
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(DefaultBodyLimit::disable())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            browser_session_middleware,
+        ))
         .with_state(state)
         .fallback(axum::routing::get(crate::embedded_ui::serve))
 }
@@ -144,6 +154,10 @@ async fn api_whoami(State(st): State<AppState>, headers: HeaderMap) -> ApiResult
     // The Web UI tells a guest session apart from an upstream OIDC assertion by this flag.
     if let Value::Object(map) = &mut body {
         map.insert("anonymous".into(), Value::Bool(anonymous));
+        map.insert(
+            "browser_session".into(),
+            Value::Bool(crate::auth::session_cookie(&headers).is_some()),
+        );
     }
     Ok(Json(body))
 }
@@ -290,6 +304,7 @@ impl IntoResponse for ApiError {
             Error::Duplicate(s) | Error::NotEmpty(s) | Error::RevisionMismatch(s) => {
                 (StatusCode::CONFLICT, s.clone())
             }
+            Error::BinaryEntry(s) => (StatusCode::CONFLICT, s.clone()),
             Error::InvalidInput(s) => (StatusCode::BAD_REQUEST, s.clone()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
         };
@@ -358,7 +373,8 @@ async fn extract_put_patch_content(
     }
     match serde_json::from_slice::<PutDocumentBody>(&body) {
         Ok(b) => Ok(b.content),
-        Err(_) => Ok(String::from_utf8_lossy(&body).into_owned()),
+        Err(_) => String::from_utf8(body.to_vec())
+            .map_err(|_| ApiError(Error::InvalidInput("text must be valid UTF-8".into()))),
     }
 }
 
@@ -494,11 +510,18 @@ async fn get_or_list(
                     }
                 };
             }
-            let (meta, body) = st.db.cat_document_bundle(fid).await?;
+            let meta = st.db.document_ref_by_path(&canon).await?;
+            let body = if meta.is_binary() {
+                None
+            } else {
+                Some(st.db.get_document(fid).await?)
+            };
             Ok(Json(json!({
                 "id": meta.id().raw(),
                 "path": meta.canonical_path(),
                 "content": body,
+                "content_kind": meta.content_kind(),
+                "sha256": meta.sha256(),
                 "metadata": st.db.document_metadata(meta.canonical_path()).await?,
                 "created_at": meta.created_at(),
                 "modified_at": meta.modified_at(),
@@ -1220,6 +1243,53 @@ pub(crate) async fn dispatch_app_rpc(
                 "revision": meta.revision(),
             }))
         }
+        "put_binary" => {
+            use base64::Engine;
+            use sha2::{Digest, Sha256};
+            use std::io::Write;
+            let path = rpc_path(&m, "path")?;
+            check_write(auth, &path)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(get_str(&m, "content_base64")?)
+                .map_err(|_| Error::InvalidInput("invalid Base64".into()))?;
+            let mime = m
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let only = get_optional_uuid_str(&m, "only_if_revision")?;
+            let mut upload = st.db.new_binary_upload()?;
+            upload.write_all(&bytes).map_err(Error::from)?;
+            upload.as_file().sync_all().map_err(Error::from)?;
+            let size = i64::try_from(bytes.len())
+                .map_err(|_| Error::InvalidInput("size overflow".into()))?;
+            st.db
+                .put_binary_file(
+                    &path,
+                    upload.path(),
+                    mime,
+                    size,
+                    &format!("{:x}", Sha256::digest(&bytes)),
+                    only.as_deref(),
+                )
+                .await?;
+            let meta = st.db.document_ref_by_path(&path).await?;
+            Ok(
+                json!({"path":path,"revision":meta.revision(),"size_bytes":meta.size_bytes(),"sha256":meta.sha256(),"content_kind":meta.content_kind()}),
+            )
+        }
+        "get_binary" => {
+            use base64::Engine;
+            use std::io::Read;
+            let path = rpc_path(&m, "path")?;
+            check_read(auth, &path)?;
+            let id = st.db.resolve_existing_file_path(&path).await?;
+            let (meta, mut file) = st.db.open_binary_file(id).await?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(Error::from)?;
+            Ok(
+                json!({"path":path,"content_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"mime_type":meta.mime_type(),"revision":meta.revision(),"sha256":meta.sha256(),"size_bytes":meta.size_bytes()}),
+            )
+        }
         "put_document" => {
             let path = rpc_path(&m, "path")?;
             let content = normalize_put_content(get_str(&m, "content")?.to_owned());
@@ -1416,11 +1486,19 @@ pub(crate) async fn dispatch_app_rpc(
             let path = rpc_path(&m, "path")?;
             check_read(auth, &path).map_err(RpcAppError::Other)?;
             let fid = st.db.resolve_existing_file_path(&path).await?;
-            let (meta, body) = st.db.cat_document_bundle(fid).await?;
+            let meta = st.db.document_ref_by_path(&path).await?;
+            let body = if meta.is_binary() {
+                None
+            } else {
+                Some(st.db.get_document(fid).await?)
+            };
             Ok(json!({
                 "id": meta.id().raw(),
                 "path": meta.canonical_path(),
                 "content": body,
+                "content_kind":meta.content_kind(),
+                "sha256":meta.sha256(),
+                "content_url":format!("/api/content{}",meta.canonical_path()),
                 "metadata": st.db.document_metadata(meta.canonical_path()).await?,
                 "created_at": meta.created_at(),
                 "modified_at": meta.modified_at(),
@@ -1800,4 +1878,299 @@ mod access_psk_gen_tests {
         }
         assert!(saw_upper && saw_lower && saw_digit);
     }
+}
+
+async fn rest_put_content(
+    State(st): State<AppState>,
+    Path(rest): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Response> {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+    let auth = api_resolve_auth(&st, &headers).await?;
+    let path = rest_to_canonical(&rest);
+    check_write(&auth, &path)?;
+    let supplied = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let mime = supplied.map(str::to_owned).unwrap_or_else(|| {
+        mime_guess::from_path(&path)
+            .first_raw()
+            .unwrap_or(if std::path::Path::new(&path).extension().is_some() {
+                "application/octet-stream"
+            } else {
+                "text/markdown"
+            })
+            .to_owned()
+    });
+    let expected = headers
+        .get(header::IF_MATCH)
+        .map(|v| {
+            v.to_str()
+                .map(|s| s.trim_matches('"').to_owned())
+                .map_err(|_| Error::InvalidInput("invalid If-Match".into()))
+        })
+        .transpose()?;
+    let expected = if headers.get(header::IF_NONE_MATCH).is_some_and(|v| v == "*") {
+        Some("*".to_owned())
+    } else {
+        expected
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| Error::InvalidInput("invalid Content-Length".into()))
+        })
+        .transpose()?;
+    let upload = st.db.new_binary_upload()?;
+    let mut file = tokio::fs::File::from_std(upload.as_file().try_clone()?);
+    let mut stream = body.into_data_stream();
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| Error::InvalidInput("interrupted upload".into()))?;
+        size = size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| Error::InvalidInput("size overflow".into()))?;
+        hash.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    if declared.is_some_and(|n| n != size) {
+        return Err(Error::InvalidInput("Content-Length mismatch".into()).into());
+    }
+    let is_text = mime.starts_with("text/")
+        || matches!(
+            mime.split(';').next().unwrap_or(""),
+            "application/json" | "application/xml" | "application/javascript"
+        );
+    if is_text {
+        let bytes = tokio::fs::read(upload.path()).await?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| Error::InvalidInput("text content must be valid UTF-8".into()))?;
+        match st.db.document_ref_by_path(&path).await {
+            Ok(meta) => {
+                st.db
+                    .replace_binary_with_text(meta.id(), &text, &mime, expected.as_deref())
+                    .await?
+            }
+            Err(Error::NotFound(_)) => {
+                st.db
+                    .put_document_by_path(
+                        &path,
+                        &text,
+                        expected.as_deref() != Some("*"),
+                        expected.as_deref().filter(|r| *r != "*"),
+                    )
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        let size = i64::try_from(size).map_err(|_| Error::InvalidInput("size overflow".into()))?;
+        st.db
+            .put_binary_file(
+                &path,
+                upload.path(),
+                &mime,
+                size,
+                &format!("{:x}", hash.finalize()),
+                expected.as_deref(),
+            )
+            .await?;
+    }
+    let meta = st.db.document_ref_by_path(&path).await?;
+    Ok(Json(json!({"path":path,"revision":meta.revision(),"content_kind":meta.content_kind(),"size_bytes":meta.size_bytes(),"sha256":meta.sha256()})).into_response())
+}
+
+async fn rest_get_content(
+    State(st): State<AppState>,
+    Path(rest): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let auth = api_resolve_auth(&st, &headers).await?;
+    let path = rest_to_canonical(&rest);
+    check_read(&auth, &path)?;
+    let initial = st.db.document_ref_by_path(&path).await?;
+    if !initial.is_binary() {
+        let content = st.db.get_document(initial.id()).await?;
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            content,
+        )
+            .into_response());
+    }
+    let (meta, file) = st.db.open_binary_file(initial.id()).await?;
+    let size = u64::try_from(meta.size_bytes())
+        .map_err(|_| Error::InvalidInput("invalid stored size".into()))?;
+    let etag = format!("\"{}\"", meta.revision().unwrap_or(""));
+    let mut start = 0u64;
+    let mut count = size;
+    let mut status = StatusCode::OK;
+    if headers
+        .get(header::IF_RANGE)
+        .is_none_or(|v| v.as_bytes() == etag.as_bytes())
+    {
+        if let Some(range) = headers.get(header::RANGE) {
+            let parsed = range
+                .to_str()
+                .ok()
+                .and_then(|v| v.strip_prefix("bytes="))
+                .and_then(|v| v.split_once('-'))
+                .and_then(|(a, b)| {
+                    if a.is_empty() {
+                        let suffix = b.parse::<u64>().ok()?;
+                        if suffix == 0 || size == 0 {
+                            return None;
+                        }
+                        Some((size.saturating_sub(suffix), size - 1))
+                    } else {
+                        let first = a.parse::<u64>().ok()?;
+                        let last = if b.is_empty() {
+                            size.checked_sub(1)?
+                        } else {
+                            b.parse::<u64>().ok()?.min(size.checked_sub(1)?)
+                        };
+                        (first <= last && first < size).then_some((first, last))
+                    }
+                });
+            let Some((first, last)) = parsed else {
+                return Ok((
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+                )
+                    .into_response());
+            };
+            start = first;
+            count = last - first + 1;
+            status = StatusCode::PARTIAL_CONTENT;
+        }
+    }
+    let mut file = tokio::fs::File::from_std(file);
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let stream = tokio_util::io::ReaderStream::new(file.take(count));
+    let mime = meta.mime_type().unwrap_or("application/octet-stream");
+    let inline = matches!(
+        mime,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4" | "video/webm"
+    );
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, count)
+        .header(header::ETAG, etag)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_DISPOSITION,
+            if inline { "inline" } else { "attachment" },
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, "sandbox")
+        .header(header::CACHE_CONTROL, "private, no-cache");
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, start + count - 1, size),
+        );
+    }
+    response
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| Error::InvalidInput("invalid stored response metadata".into()).into())
+}
+
+fn browser_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "tb_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=34560000{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+async fn browser_session_middleware(
+    State(st): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let token = crate::auth::session_cookie(request.headers()).map(str::to_owned);
+    let secure = request.uri().scheme_str() == Some("https");
+    let has_key = request.headers().contains_key("x-auth-key");
+    if token.is_some()
+        && !has_key
+        && !matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        )
+    {
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok());
+        let matches = origin.zip(host).is_some_and(|(origin, host)| {
+            origin == format!("http://{host}") || origin == format!("https://{host}")
+        });
+        if !matches {
+            return ApiError(Error::Forbidden(
+                "cookie mutation requires same-origin Origin".into(),
+            ))
+            .into_response();
+        }
+    }
+    let renew = if let Some(token) = token {
+        match st.db.resolve_browser_session(&token).await {
+            Ok(Some(_)) => Some(token),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let logout = request.uri().path() == "/api/session/logout";
+    let mut response = next.run(request).await;
+    if !logout {
+        if let Some(token) = renew {
+            if let Ok(value) = HeaderValue::from_str(&browser_cookie(&token, secure)) {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+        }
+    }
+    response
+}
+
+async fn browser_login(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let key = headers
+        .get("x-auth-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Unauthorized("login requires X-Auth-Key".into()))?;
+    let token = st.db.create_browser_session(key).await?;
+    Ok((
+        [(header::SET_COOKIE, browser_cookie(&token, false))],
+        Json(json!({"ok":true})),
+    )
+        .into_response())
+}
+
+async fn browser_logout(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    if let Some(token) = crate::auth::session_cookie(&headers) {
+        st.db.delete_browser_session(token).await?;
+    }
+    Ok((
+        [(
+            header::SET_COOKIE,
+            "tb_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        )],
+        Json(json!({"ok":true})),
+    )
+        .into_response())
 }

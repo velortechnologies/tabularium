@@ -119,3 +119,14 @@ CI includes deterministic equal-date fixtures and offline semantic retrieval
 controls (literal miss, semantic hit, unrelated negative, exact quote/slice,
 revision and ACL/path). These validate retrieval plumbing, not real-model
 relevance. Real embeddings still need a deployment-specific evaluation set.
+
+## Binary attachments
+
+`put_binary` takes `path`, `content_base64`, optional `mime_type` and
+`only_if_revision`. `get_binary` takes `path` and returns Base64 plus attachment
+metadata. These methods are also exposed by MCP. Prefer streamed REST
+`/api/content/<path>` for large files: JSON/Base64 buffers in memory and the
+existing RPC request limit still applies. Ordinary get/list/search responses
+never contain Base64 or internal blob locations.
+
+CLI `import` and `export` preserve raw binary bytes and metadata sidecars.

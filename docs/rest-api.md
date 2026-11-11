@@ -111,3 +111,23 @@ CI includes deterministic equal-date fixtures and offline semantic retrieval
 controls (literal miss, semantic hit, unrelated negative, exact quote/slice,
 revision and ACL/path). These validate retrieval plumbing, not real-model
 relevance. Real embeddings still need a deployment-specific evaluation set.
+
+## Binary content and browser sessions
+
+`PUT /api/content/<path>` accepts streamed bytes without an application body
+limit. Content-Type wins, otherwise MIME is inferred from the extension;
+no extension defaults to Markdown. Text MIME requires UTF-8. Use `If-Match`
+with the current quoted revision for conditional replacement.
+
+`GET` and `HEAD` on the same route return raw content, MIME, Content-Length
+and a revision ETag. Single byte ranges support 206/416 and If-Range. Path
+ACLs apply to every read. Unsafe inline types download as attachments.
+`GET /api/doc/<path>` returns binary metadata with `content: null`,
+`content_kind: "binary_attachment"`, `size_bytes`, `mime_type`, and `sha256`.
+Legacy text writes to binary entries fail rather than corrupting content.
+
+`POST /api/session/login` with X-Auth-Key creates an HttpOnly SameSite=Strict
+cookie. Server sessions do not expire; logout or key/ACL removal revokes them.
+`POST /api/session/logout` revokes the current cookie session. Cookie-authenticated
+mutations require a same-origin Origin header. API key authentication remains
+available. Media URLs do not carry keys.

@@ -1,4 +1,5 @@
 //! Database facade: `Storage` + Tantivy + read-through cache (`moka`).
+mod blob;
 
 mod entry_kind;
 mod meta;
@@ -93,6 +94,25 @@ pub struct Database<S: Storage> {
 pub type SqliteDatabase = Database<SqliteStorage>;
 
 impl SqliteDatabase {
+    pub fn set_blob_root(&mut self, root: std::path::PathBuf) {
+        self.storage.set_blob_root(root);
+    }
+    pub async fn create_browser_session(&self, key: &str) -> Result<String> {
+        self.storage.create_browser_session(key).await
+    }
+    pub async fn resolve_browser_session(&self, token: &str) -> Result<Option<AuthContext>> {
+        match self.storage.browser_session_acl(token).await? {
+            Some(name) => self.resolve_acl_named(&name).await,
+            None => Ok(None),
+        }
+    }
+    pub async fn delete_browser_session(&self, token: &str) -> Result<()> {
+        self.storage.delete_browser_session(token).await
+    }
+
+    pub fn new_binary_upload(&self) -> Result<tempfile::NamedTempFile> {
+        self.storage.new_binary_upload()
+    }
     /// Opens SQLite at `db_uri`, Tantivy at `index_path`, and configures the body cache.
     ///
     /// `cache_size` is the max number of cached document bodies; `0` keeps a cache handle but
@@ -171,6 +191,72 @@ impl SqliteDatabase {
 }
 
 impl<S: Storage> Database<S> {
+    pub async fn replace_binary_with_text(
+        &self,
+        id: EntryId,
+        content: &str,
+        mime: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.storage
+            .replace_binary_with_text(id, content, mime, expected_revision)
+            .await?;
+        self.cache.invalidate(&id).await;
+        self.reindex_file_in_search(id).await?;
+        self.bump_doc_wait(id);
+        Ok(())
+    }
+
+    async fn copy_file_content(&self, id: EntryId, destination: &str) -> Result<()> {
+        if self.storage.get_file_meta(id).await?.is_binary() {
+            let (meta, mut source) = self.storage.open_binary_file(id).await?;
+            let mut temporary = self.storage.new_binary_upload()?;
+            std::io::copy(&mut source, &mut temporary)?;
+            temporary.as_file().sync_all()?;
+            self.put_binary_file(
+                destination,
+                temporary.path(),
+                meta.mime_type().unwrap_or("application/octet-stream"),
+                meta.size_bytes(),
+                meta.sha256().unwrap_or(""),
+                None,
+            )
+            .await?;
+        } else {
+            let body = self.get_document(id).await?;
+            self.put_document_by_path(destination, &body, true, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn put_binary_file(
+        &self,
+        path: &str,
+        temporary: &std::path::Path,
+        mime: &str,
+        size: i64,
+        sha256: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<EntryId> {
+        let id = self
+            .storage
+            .put_binary_file(path, temporary, mime, size, sha256, expected_revision)
+            .await?;
+        self.cache.invalidate(&id).await;
+        self.reindex_file_in_search(id).await?;
+        self.bump_doc_wait(id);
+        Ok(id)
+    }
+    pub async fn open_binary_file(
+        &self,
+        file_id: EntryId,
+    ) -> Result<(DocumentMeta, std::fs::File)> {
+        let result = self.storage.open_binary_file(file_id).await?;
+        self.storage.touch(file_id).await?;
+        Ok(result)
+    }
+
     pub(crate) fn doc_append_mutex(&self, file_id: EntryId) -> Arc<Mutex<()>> {
         self.doc_append_locks
             .entry(file_id)
@@ -525,6 +611,9 @@ impl<S: Storage> Database<S> {
     /// Read-through cache; `touch` runs after content is resolved.
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     pub async fn get_document(&self, file_id: EntryId) -> Result<String> {
+        if self.storage.get_file_meta(file_id).await?.is_binary() {
+            return Err(Error::BinaryEntry(file_id.to_string()));
+        }
         let content = if self.cache_active {
             if let Some(hit) = self.cache.get(&file_id).await {
                 hit

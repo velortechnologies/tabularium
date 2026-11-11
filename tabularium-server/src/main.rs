@@ -81,6 +81,9 @@ async fn run(
 
     let db_uri = format!("sqlite://{}", cfg.server.database_path.display());
     let mut db = tabularium::SqliteDatabase::init(&db_uri, &cfg.server.index_dir, 256).await?;
+    if let Some(root) = &cfg.server.blob_root {
+        db.set_blob_root(root.clone());
+    }
     if let Some(semantic) = cfg.semantic {
         db = db
             .with_semantic(

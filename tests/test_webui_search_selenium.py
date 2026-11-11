@@ -1,6 +1,6 @@
 """Selenium coverage for meetings/webui.search — Ferrum test manifest T01–T20.
 
-Prerequisites: TABULARIUM_TEST_URL pointing at http://10.90.1.102:<port> (AGENTS.md).
+Prerequisites: TABULARIUM_TEST_URL pointing at http://10.90.1.71:<port> (AGENTS.md).
 """
 
 from __future__ import annotations

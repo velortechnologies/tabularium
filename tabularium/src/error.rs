@@ -8,6 +8,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// All failure modes surfaced to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("binary entry cannot be used as text: {0}")]
+    BinaryEntry(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("duplicate: {0}")]

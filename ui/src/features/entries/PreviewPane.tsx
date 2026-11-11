@@ -55,6 +55,7 @@ interface PreviewPaneProps {
   pathLabel: string | null;
   content: string | null;
   mimeType?: string | null;
+  binary?: boolean;
   loading: boolean;
   error: string | null;
   /** When set (e.g. after opening a search hit), matching terms are highlighted. */
@@ -79,6 +80,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       pathLabel,
       content,
       mimeType,
+      binary = false,
       loading,
       error,
       highlightQuery,
@@ -93,6 +95,9 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     },
     ref,
   ) {
+    const [mediaFailed, setMediaFailed] = useState(false);
+    useEffect(() => setMediaFailed(false), [pathLabel]);
+    const mediaUrl = pathLabel ? `/api/content${pathLabel.split("/").map(encodeURIComponent).join("/")}` : "";
     const navigate = useNavigate();
     const editorRef = useRef<HTMLTextAreaElement>(null);
     const [rawMode, setRawMode] = useState(false);
@@ -334,7 +339,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     );
 
     const startEdit = useCallback(async () => {
-      if (pathLabel === null || saving || editLoading) {
+      if (binary || pathLabel === null || saving || editLoading) {
         return;
       }
       setEditPrepareError(null);
@@ -351,10 +356,15 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       } finally {
         setEditLoading(false);
       }
-    }, [pathLabel, saving, editLoading, onPreviewContentSynced]);
+    }, [binary, pathLabel, saving, editLoading, onPreviewContentSynced]);
 
     const downloadDocument = useCallback(async () => {
       if (!pathLabel || downloading) return;
+      if (binary) {
+        const link = document.createElement("a");
+        link.href = mediaUrl; link.download = pathLabel.split("/").pop() || "attachment";
+        document.body.appendChild(link); link.click(); link.remove(); return;
+      }
       setDownloading(true);
       setDownloadError(null);
       try {
@@ -373,7 +383,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       } finally {
         setDownloading(false);
       }
-    }, [pathLabel, downloading]);
+    }, [pathLabel, downloading, binary, mediaUrl]);
 
     const cancelEdit = useCallback(() => {
       setEditMode(false);
@@ -392,9 +402,9 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       }
     }, [documentSurface, onDocumentSurfaceChange, onRequestDocumentReload]);
 
-    const showPreviewBody =
+    const showPreviewBody = !binary &&
       documentSurface === "preview" && !editMode && !metaMode && showDoc;
-    const showChatBody =
+    const showChatBody = !binary &&
       documentSurface === "chat" && !editMode && !metaMode && pathLabel != null;
 
     return (
@@ -457,7 +467,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   type="button"
                   className={styles.rawToggle}
                   data-testid="preview-raw-toggle"
-                  disabled={editMode || loading}
+                  disabled={binary || editMode || loading}
                   onClick={() => {
                     onRequestDocumentReload?.();
                     setMetaMode(false);
@@ -472,7 +482,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   type="button"
                   className={styles.chatToggle}
                   data-testid="preview-chat"
-                  disabled={editLoading}
+                  disabled={binary || editLoading}
                   onClick={() => { setMetaMode(false); toggleChatSurface(); }}
                 >
                   {documentSurface === "chat" ? "Preview" : "Chat"}
@@ -507,7 +517,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   className={styles.editSave}
                   data-testid="preview-edit"
                   title="Edit document body"
-                  disabled={editLoading || metaMode}
+                  disabled={binary || editLoading || metaMode}
                   onClick={() => {
                     setMetaMode(false);
                     void startEdit();
@@ -574,6 +584,16 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                 }}
                 onKeyDown={onEditorKeyDown}
               />
+            </div>
+          ) : null}
+          {binary && !loading && !error && !metaMode ? (
+            <div style={{height:"min(70vh, 800px)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"1rem"}}>
+              {!mediaFailed && ["image/jpeg","image/png","image/gif","image/webp"].includes(mimeType ?? "") ?
+                <img src={mediaUrl} alt={pathLabel ?? "Attachment"} style={{maxWidth:"100%",maxHeight:"90%",objectFit:"contain"}} onError={() => setMediaFailed(true)} /> :
+                !mediaFailed && ["video/mp4","video/webm"].includes(mimeType ?? "") ?
+                <video src={mediaUrl} controls preload="metadata" style={{maxWidth:"100%",maxHeight:"90%",objectFit:"contain"}} onError={() => setMediaFailed(true)} /> :
+                <strong>Binary attachment</strong>}
+              <a href={mediaUrl} download={pathLabel?.split("/").pop()}>Download</a>
             </div>
           ) : null}
           {showPreviewBody && rawMode ? (

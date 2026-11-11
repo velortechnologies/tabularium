@@ -52,6 +52,9 @@ impl<S: Storage> Database<S> {
     }
     async fn semantic_document(&self, id: EntryId) -> Result<SemanticDocument> {
         let before = self.storage.get_file_meta(id).await?;
+        if before.is_binary() {
+            return Err(Error::NotFound(id.to_string()));
+        }
         let body = self.storage.get_file_content(id).await?;
         let after = self.storage.get_file_meta(id).await?;
         if before.revision() != after.revision()
@@ -172,7 +175,9 @@ impl<S: Storage> Database<S> {
             let rows = self.storage.files_for_search_reindex(path).await?;
             let mut documents = Vec::with_capacity(rows.len());
             for (id, _, _, _, _) in rows {
-                documents.push(self.semantic_document(id).await?);
+                if !self.storage.get_file_meta(id).await?.is_binary() {
+                    documents.push(self.semantic_document(id).await?);
+                }
             }
             index.replace(&documents, path, true).await?;
             index.wake.notify_one();
