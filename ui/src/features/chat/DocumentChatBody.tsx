@@ -11,6 +11,7 @@ import {
   type RefObject,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import { MarkdownMedia } from "../../markdown/MarkdownMedia";
 import rehypeSanitize from "rehype-sanitize";
 
 import {
@@ -199,7 +200,7 @@ export const DocumentChatBody = forwardRef<
             rehypeKatex,
             [rehypeSanitize, gfmTableKatexSanitizeSchema],
           ]}
-          components={diagramComponents}
+          components={{...diagramComponents, img: ({src, alt}) => <MarkdownMedia key={`${path}:${src}`} source={src ?? ""} caption={alt ?? ""} documentPath={path} />}}
         >
           {transcript}
         </ReactMarkdown>

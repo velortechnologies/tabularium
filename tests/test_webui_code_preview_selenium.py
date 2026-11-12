@@ -87,6 +87,8 @@ def test_metadata_readonly_and_full_preview_path(selenium_driver, tabularium_bas
     d.set_window_size(width, 900)
     name = "long-document-path-that-must-wrap-without-truncation-example.md"
     wait = open_preview(d, tabularium_base_url, name, "# Body stays separate")
+    # On mobile the empty preview is remounted when the selected path arrives.
+    wait.until(lambda d: d.find_element(By.CSS_SELECTOR, "[data-testid='preview-pane'] h1"))
     title = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, "[data-testid='preview-path']"))
     path = title.get_attribute("textContent")
     copy_button = d.find_element(By.CSS_SELECTOR, "[title='Copy path']")

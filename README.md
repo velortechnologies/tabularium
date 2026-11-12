@@ -120,3 +120,7 @@ Search and reindex accept `kind`: `lexical`, `semantic`, or `hybrid` (default).
 Optional `[semantic]` config enables OpenAI-compatible embeddings, including custom HTTP headers.
 The semantic sidecar is rebuilt without migrating the document database.
 See [semantic search](docs/semantic-search.md) for configuration, API status envelopes, upgrade steps, and fallback behavior.
+
+Markdown can embed stored image, video and audio documents, including relative paths: see [Markdown media](docs/markdown-media.md).
+
+Document view URL hints: [document-view-links.md](docs/document-view-links.md).

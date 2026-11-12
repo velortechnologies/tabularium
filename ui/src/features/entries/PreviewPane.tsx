@@ -10,9 +10,10 @@ import {
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import { MarkdownMedia } from "../../markdown/MarkdownMedia";
 import rehypeSanitize from "rehype-sanitize";
 import type { Schema } from "hast-util-sanitize";
-import { useNavigate } from "react-router-dom";
+import { useSearchParams, useNavigate } from "react-router-dom";
 import { getDocument, putDocument, rpcCall } from "../../api/client";
 import { DocumentChatBody } from "../chat/DocumentChatBody";
 import {
@@ -100,11 +101,22 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const mediaUrl = pathLabel ? `/api/content${pathLabel.split("/").map(encodeURIComponent).join("/")}` : "";
     const navigate = useNavigate();
     const editorRef = useRef<HTMLTextAreaElement>(null);
-    const [rawMode, setRawMode] = useState(false);
-    const [metaMode, setMetaMode] = useState(false);
+    const [modeParams, setModeParams] = useSearchParams();
+    const rawMode = modeParams.get("raw") === "1";
+    const metaMode = modeParams.get("meta") === "1";
+    const setModeHint = useCallback((key: string, value: boolean | ((old: boolean) => boolean)) => {
+      setModeParams(prev => {
+        const next = new URLSearchParams(prev);
+        const enabled = typeof value === "function" ? value(prev.get(key) === "1") : value;
+        if (key === "raw" || key === "edit") next.delete("meta");
+        if (enabled) next.set(key, "1"); else next.delete(key);
+        return next;
+      }, { replace: true });
+    }, [setModeParams]);
+    const setRawMode = (value: boolean | ((old: boolean) => boolean)) => setModeHint("raw", value);
+    const setMetaMode = (value: boolean | ((old: boolean) => boolean)) => setModeHint("meta", value);
     const [metadata, setMetadata] = useState<string | null>(null);
     const [metadataError, setMetadataError] = useState<string | null>(null);
-    useEffect(() => { setMetaMode(false); }, [pathLabel]);
     useEffect(() => {
       let active = true;
       setMetadata(null);
@@ -239,6 +251,9 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const markdownComponents = useMemo(() => {
       return {
         ...diagramComponents,
+        img: ({ src, alt }: { src?: string; alt?: string }) => (
+          <MarkdownMedia key={`${pathLabel}:${src}`} source={src ?? ""} caption={alt ?? ""} documentPath={pathLabel ?? "/"} />
+        ),
         a: ({
           href,
           children,
@@ -275,7 +290,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
           );
         },
       };
-    }, [navigate, resolveHref]);
+    }, [navigate, resolveHref, pathLabel]);
 
     const showDoc = !loading && !error && content !== null;
     const docIdentified = pathLabel != null && !error;
@@ -284,7 +299,6 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const showFullscreenToggle =
       docIdentified &&
       (documentSurface === "preview" || documentSurface === "chat") &&
-      !editMode &&
       (showDoc || loading);
     const showChatToggle = pathLabel != null && showDoc && !editMode;
     const dirty = editMode && draft !== baseline;
@@ -317,6 +331,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       try {
         await putDocument(pathLabel, draft);
         setEditMode(false);
+        setModeHint("edit", false);
         setSaveError(null);
         onDocumentSaved?.();
       } catch (e) {
@@ -324,7 +339,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       } finally {
         setSaving(false);
       }
-    }, [pathLabel, saving, draft, baseline, onDocumentSaved]);
+    }, [pathLabel, saving, draft, baseline, onDocumentSaved, setModeHint]);
 
     const onEditorKeyDown = useCallback(
       (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -338,10 +353,12 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
       [canSave, handleSave],
     );
 
+    const editHintAttempted = useRef(false);
     const startEdit = useCallback(async () => {
       if (binary || pathLabel === null || saving || editLoading) {
         return;
       }
+      editHintAttempted.current = true;
       setEditPrepareError(null);
       setEditLoading(true);
       try {
@@ -351,12 +368,24 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
         setSaveError(null);
         onPreviewContentSynced?.(doc.content);
         setEditMode(true);
+        setModeHint("edit", true);
       } catch (e) {
         setEditPrepareError(e instanceof Error ? e.message : String(e));
       } finally {
         setEditLoading(false);
       }
-    }, [binary, pathLabel, saving, editLoading, onPreviewContentSynced]);
+    }, [binary, pathLabel, saving, editLoading, onPreviewContentSynced, setModeHint]);
+
+    useEffect(() => {
+      if (modeParams.get("edit") !== "1") {
+        if (!editMode && !editLoading) editHintAttempted.current = false;
+        return;
+      }
+      if (!loading && content !== null && !error && !binary && !editMode && !editHintAttempted.current) {
+        editHintAttempted.current = true;
+        void startEdit();
+      }
+    }, [modeParams, loading, content, error, binary, editMode, editLoading, startEdit]);
 
     const downloadDocument = useCallback(async () => {
       if (!pathLabel || downloading) return;
@@ -387,11 +416,12 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
 
     const cancelEdit = useCallback(() => {
       setEditMode(false);
+      setModeHint("edit", false);
       setSaveError(null);
       setEditPrepareError(null);
       setDraft("");
       setBaseline("");
-    }, []);
+    }, [setModeHint]);
 
     const toggleChatSurface = useCallback(() => {
       if (documentSurface === "chat") {
@@ -470,7 +500,6 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   disabled={binary || editMode || loading}
                   onClick={() => {
                     onRequestDocumentReload?.();
-                    setMetaMode(false);
                     setRawMode((r) => !r);
                   }}
                 >
@@ -483,7 +512,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   className={styles.chatToggle}
                   data-testid="preview-chat"
                   disabled={binary || editLoading}
-                  onClick={() => { setMetaMode(false); toggleChatSurface(); }}
+                  onClick={toggleChatSurface}
                 >
                   {documentSurface === "chat" ? "Preview" : "Chat"}
                 </button>
@@ -519,7 +548,6 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   title="Edit document body"
                   disabled={binary || editLoading || metaMode}
                   onClick={() => {
-                    setMetaMode(false);
                     void startEdit();
                   }}
                 >
