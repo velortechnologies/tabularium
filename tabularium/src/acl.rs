@@ -126,7 +126,8 @@ impl AuthContext {
         if self.admin {
             return Ok(());
         }
-        let rel = absolute_to_rel(abs_path)?;
+        let source_path = abs_path.split_once('@').map_or(abs_path, |(p, _)| p);
+        let rel = absolute_to_rel(source_path)?;
         check_side(&rel, &self.deny.read, &self.allow.read, "read denied")
     }
 
@@ -134,7 +135,8 @@ impl AuthContext {
         if self.admin {
             return Ok(());
         }
-        let rel = absolute_to_rel(abs_path)?;
+        let source_path = abs_path.split_once('@').map_or(abs_path, |(p, _)| p);
+        let rel = absolute_to_rel(source_path)?;
         check_side(&rel, &self.deny.write, &self.allow.write, "write denied")
     }
 
@@ -159,7 +161,8 @@ impl AuthContext {
         if kind != crate::EntryKind::Dir {
             return Ok(false);
         }
-        let rel = absolute_to_rel(abs_path)?;
+        let source_path = abs_path.split_once('@').map_or(abs_path, |(p, _)| p);
+        let rel = absolute_to_rel(source_path)?;
         Ok(self.allow_reaches_directory_for_listing(&rel))
     }
 

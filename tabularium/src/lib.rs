@@ -59,3 +59,5 @@ pub use text_lines::TailMode;
 pub use validation::{validate_chat_speaker_id, validate_entity_name};
 #[cfg(feature = "db")]
 pub use wc::WcMetricsFilter;
+
+pub use validation::validate_snapshot_name;

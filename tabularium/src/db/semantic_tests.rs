@@ -483,3 +483,125 @@ async fn search_time_order_filters_ties_and_semantic_excerpts() {
     pool.close().await;
     task.abort();
 }
+
+#[tokio::test]
+async fn snapshots_semantic_filter_move_and_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, _, task) = mock().await;
+    let db = open(temp.path(), &url).await;
+    let id = db
+        .create_file_in_directory("/", "note", "backup history")
+        .await
+        .unwrap();
+    let snapshot = db.create_snapshot("/note", "old", false).await.unwrap()[0].id();
+    db.update_document(id, "cake current").await.unwrap();
+    db.reindex_kind(None, SearchKind::Hybrid).await.unwrap();
+    while db.flush_semantic_pending().await.unwrap() > 0 {}
+    for kind in [
+        SearchKind::Lexical,
+        SearchKind::Semantic,
+        SearchKind::Hybrid,
+    ] {
+        let normal = db
+            .search_report("backup", None, 100, None, kind, None)
+            .await
+            .unwrap();
+        assert!(normal.hits().iter().all(|h| h.document_id() != snapshot));
+        let history = db
+            .search_report_with_options(
+                "backup",
+                None,
+                100,
+                None,
+                kind,
+                None,
+                crate::SearchOptions {
+                    include_snapshots: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            history
+                .hits()
+                .iter()
+                .any(|h| h.document_id() == snapshot && h.path() == "/note@old")
+        );
+    }
+    for kind in [
+        SearchKind::Lexical,
+        SearchKind::Semantic,
+        SearchKind::Hybrid,
+    ] {
+        let scoped = db
+            .search_report_with_options(
+                "backup",
+                None,
+                100,
+                Some(id),
+                kind,
+                None,
+                crate::SearchOptions {
+                    include_snapshots: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(scoped.hits().iter().any(|h| h.document_id() == snapshot));
+        assert!(
+            scoped
+                .hits()
+                .iter()
+                .all(|h| h.document_id() == snapshot || h.document_id() == id)
+        );
+    }
+    db.rename_document(id, "renamed").await.unwrap();
+    while db.flush_semantic_pending().await.unwrap() > 0 {}
+    let history = db
+        .search_report_with_options(
+            "backup",
+            None,
+            100,
+            None,
+            SearchKind::Semantic,
+            None,
+            crate::SearchOptions {
+                include_snapshots: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(history.hits().iter().any(|h| h.path() == "/renamed@old"));
+    db.delete_document_recursive(id).await.unwrap();
+    while db.flush_semantic_pending().await.unwrap() > 0 {}
+    assert!(
+        !db.semantic
+            .as_ref()
+            .unwrap()
+            .indexed_ids()
+            .await
+            .unwrap()
+            .contains(&snapshot.raw())
+    );
+    db.reindex_kind(None, SearchKind::Hybrid).await.unwrap();
+    let history = db
+        .search_report_with_options(
+            "backup",
+            None,
+            100,
+            None,
+            SearchKind::Hybrid,
+            None,
+            crate::SearchOptions {
+                include_snapshots: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(history.hits().is_empty());
+    task.abort();
+}

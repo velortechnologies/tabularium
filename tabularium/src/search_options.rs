@@ -36,6 +36,8 @@ impl FromStr for SearchSort {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SearchOptions {
     #[serde(default)]
+    pub include_snapshots: bool,
+    #[serde(default)]
     pub sort: SearchSort,
     pub modified_after: Option<u64>,
     pub modified_before: Option<u64>,

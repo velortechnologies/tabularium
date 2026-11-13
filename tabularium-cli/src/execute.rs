@@ -1,7 +1,7 @@
 //! Shared command execution for one-shot CLI and interactive shell.
 
 use std::fmt::Write as _;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::UNIX_EPOCH;
@@ -858,56 +858,6 @@ async fn wait_in_shell_subprocess(path: &str, conn: &ShellChildRpc) -> Result<()
     Err(format!("wait subprocess exited with status {status}").into())
 }
 
-fn acl_edit_pause_before_reopen() -> Result<(), BoxErr> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        eprintln!("Press Enter to reopen $EDITOR (Ctrl+C to abort).");
-        io::stderr()
-            .flush()
-            .map_err(|e| -> BoxErr { e.to_string().into() })?;
-        let mut buf = String::new();
-        io::stdin()
-            .lock()
-            .read_line(&mut buf)
-            .map_err(|e| -> BoxErr { e.to_string().into() })?;
-        return Ok(());
-    }
-
-    eprintln!("Press any key to reopen $EDITOR (Ctrl+C aborts).");
-    io::stderr()
-        .flush()
-        .map_err(|e| -> BoxErr { e.to_string().into() })?;
-
-    enable_raw_mode().map_err(|e| -> BoxErr { format!("terminal raw mode: {e}").into() })?;
-
-    let pause_result = loop {
-        let ev = match event::read() {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = disable_raw_mode();
-                return Err(e.into());
-            }
-        };
-        match ev {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c'))
-                {
-                    break Err("acl-edit aborted".into());
-                }
-                break Ok(());
-            }
-            Event::Resize(_, _) => {}
-            _ => {}
-        }
-    };
-
-    disable_raw_mode().map_err(|e| -> BoxErr { format!("terminal restore: {e}").into() })?;
-    pause_result
-}
-
 /// Normal completion vs wait interrupted by Ctrl-C (CLI exits 130).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecuteOutcome {
@@ -923,16 +873,33 @@ pub(crate) async fn execute(
     shell_child_rpc: Option<&ShellChildRpc>,
     opts: ExecuteOpts,
 ) -> Result<ExecuteOutcome, BoxErr> {
+    let creating_snapshot = matches!(&command, Command::Snapshot { .. });
     match command {
         Command::Shell { .. } => {
             eprintln!("already in interactive shell (type exit to leave)");
         }
         Command::Ls {
+            snapshot,
+            recursive,
             directory,
             sort_by_time,
             reverse,
         } => {
-            run_ls_listing(client, directory, sort_by_time, reverse).await?;
+            if snapshot {
+                let path = normalize_user_path(directory.as_deref().unwrap_or("/"))?;
+                let (source, name) = match tabularium::resource_path::split_snapshot_path(&path)? {
+                    Some((source, name)) => (source, Some(name)),
+                    None => (path.as_str(), None),
+                };
+                let rows = client
+                    .snapshot_operation("list_snapshots", source, name, None, recursive)
+                    .await?;
+                for row in rows.as_array().ok_or("invalid snapshot listing")? {
+                    println!("{}", row["path"].as_str().ok_or("missing snapshot path")?);
+                }
+            } else {
+                run_ls_listing(client, directory, sort_by_time, reverse).await?;
+            }
         }
         Command::Lt { directory, reverse } => {
             run_ls_listing(client, directory, true, reverse).await?;
@@ -951,6 +918,7 @@ pub(crate) async fn execute(
             }
         }
         Command::Search {
+            include_snapshots,
             directory,
             query,
             kind,
@@ -979,6 +947,7 @@ pub(crate) async fn execute(
                     limit,
                     max_output_bytes,
                     tabularium::SearchOptions {
+                        include_snapshots,
                         sort,
                         modified_after,
                         modified_before,
@@ -1086,7 +1055,29 @@ pub(crate) async fn execute(
                 client.append_document(&path, &content).await?;
             }
         }
+        Command::Snapshot { path, recursive } | Command::Rollback { path, recursive } => {
+            let operation = if creating_snapshot {
+                "create_snapshot"
+            } else {
+                "rollback_snapshot"
+            };
+            let path = normalize_user_path(&path)?;
+            let (source, name) = tabularium::resource_path::split_snapshot_path(&path)?
+                .ok_or("expected entry@snapshot")?;
+            client
+                .snapshot_operation(operation, source, Some(name), None, recursive)
+                .await?;
+        }
         Command::Rm { path, recursive } => {
+            let normalized = normalize_user_path(&path)?;
+            if let Some((source, name)) =
+                tabularium::resource_path::split_snapshot_path(&normalized)?
+            {
+                client
+                    .snapshot_operation("delete_snapshot", source, Some(name), None, recursive)
+                    .await?;
+                return Ok(ExecuteOutcome::Ok);
+            }
             let path = path.trim().to_string();
             cmd_rm(client, &path, recursive).await?;
         }
@@ -1275,7 +1266,6 @@ pub(crate) async fn execute(
             }
         }
         Command::AclGet { name } => {
-            validate_entity_name(name.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
             let v = client.acl_get(name.trim()).await?;
             let body = v
                 .get("body")
@@ -1301,7 +1291,8 @@ pub(crate) async fn execute(
                     .and_then(|b| b.as_str())
                     .unwrap_or(template)
                     .to_string(),
-                Err(_) => template.to_string(),
+                Err(e) if edit_missing_document_error(&e) => template.to_string(),
+                Err(e) => return Err(e.into()),
             };
             let mut tmp = tempfile::Builder::new()
                 .suffix(".tabularium-acl.json")
@@ -1312,30 +1303,25 @@ pub(crate) async fn execute(
             tmp.flush()
                 .map_err(|e| -> BoxErr { e.to_string().into() })?;
             let path = tmp.path().to_path_buf();
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+            let mut file = Some(tmp);
             loop {
-                let st = StdCommand::new(&editor)
-                    .arg(&path)
-                    .status()
-                    .map_err(|e| -> BoxErr { format!("{editor}: {e}").into() })?;
-                if !st.success() {
-                    return Err(format!("$EDITOR exited with {st}").into());
+                let attempt: Result<(), BoxErr> = async {
+                    run_editor(&path)?;
+                    let new_body = std::fs::read_to_string(&path)?;
+                    parse_acl_json(new_body.trim())?;
+                    if new_body.trim() != initial.trim() {
+                        client.acl_put(name.trim(), new_body.trim()).await?;
+                    }
+                    Ok(())
                 }
-                let new_body = std::fs::read_to_string(&path)
-                    .map_err(|e| -> BoxErr { e.to_string().into() })?;
-                let trimmed = new_body.trim();
-                match parse_acl_json(trimmed) {
-                    Ok(_) => {
-                        client.acl_put(name.trim(), trimmed).await?;
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("{e}");
-                        acl_edit_pause_before_reopen()?;
-                    }
+                .await;
+                match attempt {
+                    Ok(()) => break,
+                    Err(error) => crate::editor::retry(&mut file, &error, opts.raw)?,
                 }
             }
         }
+
         Command::AclDeploy { name, file } => {
             validate_entity_name(name.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
             let body = read_input(file.as_deref().map(str::trim).filter(|s| !s.is_empty()))
@@ -1343,7 +1329,6 @@ pub(crate) async fn execute(
             client.acl_put(name.trim(), body.trim()).await?;
         }
         Command::AclDestroy { name } => {
-            validate_entity_name(name.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
             client.acl_destroy(name.trim()).await?;
         }
         Command::PskList => {
@@ -1368,7 +1353,6 @@ pub(crate) async fn execute(
             println!("{key}");
         }
         Command::PskDestroy { name } => {
-            validate_entity_name(name.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
             client.psk_destroy(name.trim()).await?;
         }
         Command::Wc {
@@ -1409,37 +1393,19 @@ pub(crate) async fn execute(
                     .open(file)?;
                 out.write_all(pretty.as_bytes())?;
             } else if edit {
-                let mut tmp = tempfile::Builder::new()
-                    .prefix("tb-meta-")
-                    .suffix(".json")
-                    .tempfile()?;
-                tmp.write_all(pretty.as_bytes())?;
-                tmp.flush()?;
-                run_editor(tmp.path())?;
-                let result = async {
-                    let value = read_metadata_file(tmp.path())?;
-                    if &value != original {
-                        client
-                            .set_document_metadata(&path, &value, revision)
-                            .await?;
-                    }
-                    Ok::<(), BoxErr>(())
-                }
-                .await;
-                if let Err(e) = result {
-                    let (_, kept) = tmp.keep()?;
-                    return Err(
-                        format!("{e}; edited metadata retained at {}", kept.display()).into(),
-                    );
-                }
+                cmd_edit_metadata(client, &path, opts.raw).await?;
             } else {
                 print!("{pretty}");
             }
         }
-        Command::Edit { path } => {
+        Command::Edit { path, metadata } => {
             let path =
                 normalize_user_path(path.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
-            cmd_edit(client, &path).await?;
+            if metadata {
+                cmd_edit_metadata(client, &path, opts.raw).await?;
+            } else {
+                cmd_edit(client, &path).await?;
+            }
         }
         Command::Mkdir {
             path,
@@ -1484,7 +1450,33 @@ pub(crate) async fn execute(
                 }
             }
         }
-        Command::Mv { src, dst } => {
+        Command::Mv {
+            src,
+            dst,
+            recursive,
+        } => {
+            let source = normalize_user_path(&src)?;
+            let destination = normalize_user_path(&dst)?;
+            if let Some((entry, name)) = tabularium::resource_path::split_snapshot_path(&source)? {
+                let Some((new_entry, new_name)) =
+                    tabularium::resource_path::split_snapshot_path(&destination)?
+                else {
+                    return Err("snapshot destination must be entry@name".into());
+                };
+                if entry != new_entry {
+                    return Err("cannot move snapshots between entries".into());
+                }
+                client
+                    .snapshot_operation(
+                        "rename_snapshot",
+                        entry,
+                        Some(name),
+                        Some(new_name),
+                        recursive,
+                    )
+                    .await?;
+                return Ok(ExecuteOutcome::Ok);
+            }
             cmd_mv(client, &src, &dst).await?;
         }
         Command::Cp {
@@ -1691,25 +1683,11 @@ async fn cmd_rm(client: &Client, path: &str, recursive: bool) -> Result<(), BoxE
     Ok(())
 }
 
-/// `rm -r /dir` — absolute single segment under root (for recursive directory delete shortcut).
-fn rm_absolute_single_segment(path: &str) -> Option<String> {
-    let path = path.trim_end_matches('/');
-    let rest = path.strip_prefix('/')?;
-    if rest.is_empty() || rest.contains('/') {
-        return None;
-    }
-    Some(format!("/{rest}"))
-}
-
 async fn cmd_rm_literal(client: &Client, path: &str, recursive: bool) -> Result<(), BoxErr> {
-    if recursive && let Some(p) = rm_absolute_single_segment(path) {
-        client.delete_directory(&p, true).await?;
-        return Ok(());
-    }
     let n = normalize_user_path(path.trim_end_matches('/'))
         .map_err(|e| -> BoxErr { e.to_string().into() })?;
     if client.document_exists(&n).await? {
-        client.delete_document(&n).await?;
+        client.delete_document_recursive(&n, recursive).await?;
         return Ok(());
     }
     client.delete_directory(&n, recursive).await?;
@@ -1810,6 +1788,11 @@ async fn cmd_cp(
 ) -> Result<(), BoxErr> {
     let src = normalize_user_path(src_user.trim_end_matches('/'))
         .map_err(|e| -> BoxErr { e.to_string().into() })?;
+    if src.contains('@') {
+        let dst = normalize_user_path(dst_user.trim_end_matches('/'))?;
+        client.cp(&src, &dst, recursive).await?;
+        return Ok(());
+    }
     let dst = resolve_cp_destination(client, &src, dst_user).await?;
     if dst == src || dst.starts_with(&format!("{}/", src.trim_end_matches('/'))) {
         return Err("cp: cannot copy into itself".into());
@@ -2356,6 +2339,38 @@ async fn export_subtree(
 
 async fn cmd_export(client: &Client, directory: &str, dest: &Path) -> Result<(), BoxErr> {
     std::fs::create_dir_all(dest).map_err(|e| format!("export: {e}"))?;
+    let normalized = normalize_user_path(directory)?;
+    if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&normalized)? {
+        let rows = client
+            .snapshot_operation("list_snapshots", source, Some(name), None, true)
+            .await?;
+        let mut failed = false;
+        for row in rows.as_array().ok_or("invalid snapshot listing")? {
+            let path = row["path"].as_str().ok_or("missing snapshot path")?;
+            let live = path.split_once('@').unwrap().0;
+            let relative = if live == source {
+                live.rsplit('/').next().unwrap()
+            } else {
+                live.strip_prefix(source).unwrap().trim_start_matches('/')
+            };
+            let output = dest.join(relative);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            failed |= export_one_file(client, path, &output).await?;
+        }
+        if failed {
+            return Err("snapshot export failed".into());
+        }
+        return Ok(());
+    }
+    if client.document_exists(&normalized).await? {
+        let output = dest.join(normalized.rsplit('/').next().ok_or("missing filename")?);
+        if export_one_file(client, &normalized, &output).await? {
+            return Err("export failed".into());
+        }
+        return Ok(());
+    }
     let mut any_error = false;
 
     if directory.trim() == "/" {
@@ -2546,47 +2561,32 @@ pub(crate) fn print_cli_table(colored_header: bool, headers: &[&str], rows: &[Ve
 
 /// Full-body edit for chat `/d` (and similar): optional conflict check on `modified_at`.
 pub(crate) async fn chat_edit_full_document(client: &Client, doc_path: &str) -> Result<(), BoxErr> {
-    let path =
-        normalize_user_path(doc_path.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
-    let original_body = client.get_document(&path).await?;
-    let original = original_body.content().to_string();
-    let before_mod = original_body.modified_at();
-    let doc_name = path.split_once('/').map_or(path.as_str(), |(_, d)| d);
-    let ext = Path::new(doc_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map_or_else(|| ".md".into(), |e| format!(".{e}"));
-    let mut tmp = tempfile::Builder::new()
-        .prefix("tb-chat-doc-")
-        .suffix(&ext)
-        .tempfile()?;
-    tmp.write_all(original.as_bytes())?;
-    tmp.flush()?;
-    let tmp_path = tmp.path().to_path_buf();
-    run_editor(&tmp_path)?;
-    let edited = std::fs::read_to_string(&tmp_path)?;
-    if edited == original {
-        return Ok(());
-    }
-    let check = client.get_document(&path).await?;
-    if check.modified_at() != before_mod {
-        return Err("document changed on the server while editing; re-open chat and retry".into());
-    }
-    client.replace_document(&path, &edited).await?;
-    Ok(())
+    cmd_edit(client, doc_path).await
 }
 
 async fn cmd_edit(client: &Client, path: &str) -> Result<(), BoxErr> {
-    let original = match client.get_document(path).await {
-        Ok(body) => body.content().to_string(),
-        Err(e) if edit_missing_document_error(&e) => {
-            client.append_document(path, "").await?;
-            client.get_document(path).await?.content().to_string()
-        }
+    if path.contains('@') {
+        return Err("snapshots are read-only".into());
+    }
+    let (original, revision) = match client.get_document(path).await {
+        Ok(body) => (
+            body.content().to_string(),
+            body.revision().map(str::to_string),
+        ),
+        Err(e) if edit_missing_document_error(&e) => (String::new(), None),
         Err(e) => return Err(e.into()),
     };
-    let doc_name = path.split_once('/').map_or(path, |(_, d)| d);
-    let ext = Path::new(doc_name)
+    edit_text_buffer(client, path, original, revision, false).await
+}
+
+async fn edit_text_buffer(
+    client: &Client,
+    path: &str,
+    original: String,
+    revision: Option<String>,
+    raw: bool,
+) -> Result<(), BoxErr> {
+    let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map_or_else(|| ".md".into(), |e| format!(".{e}"));
@@ -2596,69 +2596,34 @@ async fn cmd_edit(client: &Client, path: &str) -> Result<(), BoxErr> {
         .tempfile()?;
     tmp.write_all(original.as_bytes())?;
     tmp.flush()?;
-    let tmp_path = tmp.path().to_path_buf();
+    let mut file = Some(tmp);
     loop {
-        run_editor(&tmp_path)?;
-        let edited = std::fs::read_to_string(&tmp_path)?;
-        if edited == original {
-            break;
-        }
-        let upload = client.replace_document(path, &edited).await;
-        match upload {
-            Ok(()) => break,
-            Err(e) => {
-                eprintln!(
-                    "\x1b[1;31mUpload failed: {} (temp file: {})\x1b[0m",
-                    e,
-                    tmp_path.display()
-                );
-                eprintln!("Press Enter to re-open the editor and save elsewhere if needed…");
-                let mut buf = String::new();
-                let _ = io::stdin().read_line(&mut buf);
+        let buffer = file.as_ref().unwrap().path().to_path_buf();
+        let attempt: Result<(), BoxErr> = async {
+            run_editor(&buffer)?;
+            let edited = std::fs::read_to_string(&buffer)?;
+            if edited != original {
+                client
+                    .save_edited_document(path, &edited, revision.as_deref())
+                    .await?;
             }
+            Ok(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => crate::editor::retry(&mut file, &error, raw)?,
         }
     }
-    Ok(())
 }
 
 /// Missing-document branch for [`cmd_ec`]: no `append_document` until the user saves non-empty
 /// content from `$EDITOR` (avoids empty “ghost” rows when they quit without changes).
 async fn cmd_edit_ec_deferred(client: &Client, path: &str) -> Result<(), BoxErr> {
-    let original = String::new();
-    let doc_name = path.split_once('/').map_or(path, |(_, d)| d);
-    let ext = Path::new(doc_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map_or_else(|| ".md".into(), |e| format!(".{e}"));
-    let mut tmp = tempfile::Builder::new()
-        .prefix("tb-ec-edit-")
-        .suffix(&ext)
-        .tempfile()?;
-    tmp.write_all(original.as_bytes())?;
-    tmp.flush()?;
-    let tmp_path = tmp.path().to_path_buf();
-    loop {
-        run_editor(&tmp_path)?;
-        let edited = std::fs::read_to_string(&tmp_path)?;
-        if edited == original {
-            break;
-        }
-        let upload = client.put_document(path, &edited).await;
-        match upload {
-            Ok(()) => break,
-            Err(e) => {
-                eprintln!(
-                    "\x1b[1;31mUpload failed: {} (temp file: {})\x1b[0m",
-                    e,
-                    tmp_path.display()
-                );
-                eprintln!("Press Enter to re-open the editor and save elsewhere if needed…");
-                let mut buf = String::new();
-                let _ = io::stdin().read_line(&mut buf);
-            }
-        }
+    if path.contains('@') {
+        return Err("snapshots are read-only".into());
     }
-    Ok(())
+    edit_text_buffer(client, path, String::new(), None, false).await
 }
 
 fn edit_missing_document_error(err: &Error) -> bool {
@@ -2670,36 +2635,7 @@ fn edit_missing_document_error(err: &Error) -> bool {
 }
 
 pub(crate) fn run_editor(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let ed = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        let p = path.to_string_lossy().replace('\'', "'\\''");
-        let status = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("{ed} '{p}'"))
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("editor exited with non-zero status"))
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let ed = std::env::var("EDITOR").unwrap_or_else(|_| "notepad".into());
-        let mut parts = ed.split_whitespace();
-        let cmd = parts.next().unwrap_or("notepad");
-        let mut c = std::process::Command::new(cmd);
-        for a in parts {
-            c.arg(a);
-        }
-        let status = c.arg(path).status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("editor exited with non-zero status"))
-        }
-    }
+    crate::editor::launch(path)
 }
 
 fn read_input(file: Option<&str>) -> Result<String, io::Error> {
@@ -2787,28 +2723,6 @@ mod ls_sort_tests {
         sort_ls_rows(&mut v, true, false);
         assert_eq!(v[0].name, "dir");
         assert_eq!(v[1].name, "file");
-    }
-}
-
-#[cfg(test)]
-mod rm_path_tests {
-    use super::rm_absolute_single_segment;
-
-    #[test]
-    fn absolute_directory_slash_form() {
-        assert_eq!(rm_absolute_single_segment("/xxx").as_deref(), Some("/xxx"));
-        assert_eq!(rm_absolute_single_segment("/xxx/").as_deref(), Some("/xxx"));
-    }
-
-    #[test]
-    fn absolute_directory_rejects_multi_segment() {
-        assert_eq!(rm_absolute_single_segment("/a/b"), None);
-        assert_eq!(rm_absolute_single_segment("/"), None);
-    }
-
-    #[test]
-    fn absolute_directory_requires_leading_slash() {
-        assert_eq!(rm_absolute_single_segment("xxx"), None);
     }
 }
 
@@ -3082,5 +2996,37 @@ mod mcd_ec_integration_tests {
         }
         let body = client.get_document(path).await.unwrap();
         assert_eq!(body.content(), "omnissiah");
+    }
+}
+
+async fn cmd_edit_metadata(client: &Client, path: &str, raw: bool) -> Result<(), BoxErr> {
+    if path.contains('@') {
+        return Err("snapshots are read-only".into());
+    }
+    let snapshot = client.get_document_metadata(path).await?;
+    let original = snapshot.get("metadata").ok_or("missing metadata")?;
+    let revision = snapshot.get("revision").and_then(serde_json::Value::as_str);
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tb-meta-")
+        .suffix(".json")
+        .tempfile()?;
+    tmp.write_all((serde_json::to_string_pretty(original)? + "\n").as_bytes())?;
+    tmp.flush()?;
+    let mut file = Some(tmp);
+    loop {
+        let path_buf = file.as_ref().unwrap().path().to_path_buf();
+        let attempt: Result<(), BoxErr> = async {
+            run_editor(&path_buf)?;
+            let value = read_metadata_file(&path_buf)?;
+            if &value != original {
+                client.set_document_metadata(path, &value, revision).await?;
+            }
+            Ok(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => crate::editor::retry(&mut file, &error, raw)?,
+        }
     }
 }

@@ -8,7 +8,7 @@ Do not point agents at the REST API, the CLI, SQLite, or the Tantivy index when 
 
 Start a Tabularium server with MCP enabled. The default server build already includes the `mcp` feature.
 
-`config.toml.example` shows the MCP listener. Optional **`mcp.full`** (default `false`): when `true`, the server also registers **destructive** MCP tools (`delete_document`, `delete_directory`, `rename_*`, `move_*`, `reindex`), **`whoami`**, and **ACL/PSK** admin tools (`acl_*`, `psk_*`) — same auth headers as `/rpc`, **trusted deployments only**.
+`config.toml.example` shows the MCP listener. Optional **`mcp.full`** (default `false`): when `true`, the server also registers `reindex`, **`whoami`**, and **ACL/PSK** admin tools (`acl_*`, `psk_*`) — same auth headers as `/rpc`, **trusted deployments only**.
 
 ```toml
 [mcp]
@@ -122,3 +122,5 @@ In MCP tool terms, that sequence is: `put_document`, `say_document`, `search`, t
 ## Compact, versioned search
 
 Use `search` with `limit: 10`, `max_output_bytes: 16384` and optional `kind`. Inspect `has_more`/`truncated` independently of engine status. Each hit carries exact source text, containing line range, revision and technical modification time. Follow with `slice` using the returned `expected_revision`; on `RevisionMismatch` search again. Dates do not establish whether a statement is current. See [search API details](rest-api.md#bounded-search).
+
+Document/directory delete, move and rename are standard MCP tools, as are named snapshot operations. See [Named snapshots](snapshots.md) for selectors, recursion and search options.

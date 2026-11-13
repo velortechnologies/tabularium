@@ -159,6 +159,37 @@ impl Client {
         format!("{}/rpc", self.base)
     }
 
+    /// Execute a named snapshot operation with the same RPC authentication.
+    pub async fn snapshot_operation(
+        &self,
+        operation: &str,
+        path: &str,
+        name: Option<&str>,
+        new_name: Option<&str>,
+        recursive: bool,
+    ) -> Result<Value> {
+        if !matches!(
+            operation,
+            "create_snapshot"
+                | "list_snapshots"
+                | "delete_snapshot"
+                | "rollback_snapshot"
+                | "rename_snapshot"
+        ) {
+            return Err(Error::InvalidInput("unknown snapshot operation".into()));
+        }
+        self.call(operation, json!({"path": normalize_path_for_rpc(path)?, "name":name, "new_name":new_name, "recursive":recursive})).await
+    }
+    /// Delete a document and optionally all its snapshots.
+    pub async fn delete_document_recursive(&self, path: &str, recursive: bool) -> Result<()> {
+        self.call(
+            "delete_document",
+            json!({"path":normalize_path_for_rpc(path)?, "recursive":recursive}),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -324,7 +355,7 @@ impl Client {
     ) -> Result<SearchReportRow> {
         options.validate()?;
         let mut params = json!({"query":query.as_ref(),"kind":kind,"with_status":true,
-            "sort": options.sort});
+            "sort": options.sort, "include_snapshots": options.include_snapshots});
         if let Some(n) = options.modified_after {
             params["modified_after"] = json!(n);
         }
@@ -373,7 +404,21 @@ impl Client {
         let path = normalize_path_for_rpc(path)?;
         let params = json!({ "path": path });
         let r = self.call("get_document", params).await?;
+        if r.get("content_kind").and_then(Value::as_str) == Some("binary_attachment") {
+            return Err(Error::BinaryEntry(path));
+        }
         serde_json::from_value(r).map_err(|e| Error::InvalidInput(e.to_string()))
+    }
+
+    /// Guarded editor save; missing originals must not overwrite a concurrent creator.
+    pub async fn save_edited_document(
+        &self,
+        path: &str,
+        content: &str,
+        revision: Option<&str>,
+    ) -> Result<()> {
+        self.call("put_document", json!({"path":normalize_path_for_rpc(path)?, "content":content, "force":false, "only_if_revision":revision})).await?;
+        Ok(())
     }
 
     /// Read JSON metadata and its shared document revision.

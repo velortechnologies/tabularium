@@ -370,3 +370,14 @@
     background: #fff !important;
   }
 }
+
+.includeSnapshots {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 0.82rem;
+  white-space: nowrap;
+  cursor: pointer;
+}

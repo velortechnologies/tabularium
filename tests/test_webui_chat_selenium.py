@@ -267,7 +267,9 @@ def test_chat_c06_preview_after_chat_triggers_reload(
     _wait_preview_pane_contains(selenium_driver, m0)
     _wait_preview_chat_visible(selenium_driver)
     selenium_driver.find_element(By.CSS_SELECTOR, "[data-testid='preview-chat']").click()
-    selenium_driver.find_element(By.CSS_SELECTOR, "[data-testid='chat-gate-input']").send_keys("c06")
+    _wait(selenium_driver).until(
+        EC.visibility_of_element_located((By.CSS_SELECTOR, "[data-testid='chat-gate-input']")),
+    ).send_keys("c06")
     selenium_driver.find_element(By.CSS_SELECTOR, "[data-testid='chat-start']").click()
     _wait_chat_connected(selenium_driver, m0)
     _put_plain(base, f"{slug}/live.md", f"# c\n\n{m1}\n")

@@ -85,6 +85,9 @@ function invalidNameReason(nameRaw: string): string | null {
   if (name === "") {
     return "Name is required.";
   }
+  if (name.includes("@")) {
+    return "Name cannot contain @ (reserved for snapshots).";
+  }
   if (name === "." || name === "..") {
     return "Name cannot be . or ..";
   }
@@ -235,7 +238,9 @@ export function EntriesView() {
     [location.pathname],
   );
 
-  const openDocPath = searchParams.get(OPEN_Q);
+  const liveDocPath = searchParams.get(OPEN_Q);
+  const snapshotName = searchParams.get("snapshot");
+  const openDocPath = liveDocPath && snapshotName ? `${liveDocPath}@${snapshotName}` : liveDocPath;
 
   const editSessionRef = useRef({ active: false, dirty: false });
   const [docReloadNonce, setDocReloadNonce] = useState(0);
@@ -274,6 +279,7 @@ export function EntriesView() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
+  const [includeSnapshots, setIncludeSnapshots] = useState(false);
   const [searchKind, setSearchKind] = useState<SearchKind>("hybrid");
   const [searchSort, setSearchSort] = useState<"relevance" | "modified_desc">("relevance");
   const [modifiedAfter, setModifiedAfter] = useState("");
@@ -346,7 +352,7 @@ export function EntriesView() {
         const subtreeDir = snap?.scope === "local" ? snap.dirPath : undefined;
         const toNanos = (value: string) => value
           ? (BigInt(new Date(value).getTime()) * 1_000_000n).toString() : undefined;
-        const hits = await searchDocuments(firedQuery, { subtreeDir, kind: searchKind,
+        const hits = await searchDocuments(firedQuery, { subtreeDir, kind: searchKind, includeSnapshots,
           sort: searchSort, modifiedAfter: toNanos(modifiedAfter),
           modifiedBefore: toNanos(modifiedBefore) });
         if (!cancelled) {
@@ -366,7 +372,7 @@ export function EntriesView() {
     return () => {
       cancelled = true;
     };
-  }, [firedQuery, sessionSearchScope, searchKind, searchSort, modifiedAfter, modifiedBefore]);
+  }, [firedQuery, sessionSearchScope, searchKind, includeSnapshots, searchSort, modifiedAfter, modifiedBefore]);
 
   const confirmDiscardIfNeeded = useCallback((): boolean => {
     const s = editSessionRef.current;
@@ -393,10 +399,13 @@ export function EntriesView() {
       setSearchParams(
         (prev) => {
           const n = new URLSearchParams(prev);
+          n.delete("snapshot");
           if (nextOpen == null) {
             n.delete(OPEN_Q);
           } else {
-            n.set(OPEN_Q, nextOpen);
+            const at = nextOpen.indexOf("@");
+            n.set(OPEN_Q, at < 0 ? nextOpen : nextOpen.slice(0, at));
+            if (at >= 0) n.set("snapshot", nextOpen.slice(at + 1));
           }
           return n;
         },
@@ -1432,8 +1441,8 @@ export function EntriesView() {
           await renameDocument(sourcePath, nextName);
           const newPath = childPath(parentPath(sourcePath), nextName);
           pendingFocusName.current = nextName;
-          if (openDocPath === sourcePath) {
-            setOpenPath(newPath);
+          if (liveDocPath === sourcePath) {
+            setOpenPath(snapshotName ? `${newPath}@${snapshotName}` : newPath);
           }
         }
         reloadEntries();
@@ -1456,7 +1465,7 @@ export function EntriesView() {
             : null;
         pendingFocusName.current = nearest?.name ?? null;
         if (
-          openDocPath === state.targetPath ||
+          liveDocPath === state.targetPath ||
           (isDir &&
             openDocPath != null &&
             openDocPath.startsWith(`${state.targetPath}/`))
@@ -1484,6 +1493,8 @@ export function EntriesView() {
     isMobile,
     navigate,
     openDocPath,
+    liveDocPath,
+    snapshotName,
     orderedEntries,
     reloadEntries,
     setOpenPath,
@@ -1575,6 +1586,10 @@ export function EntriesView() {
             <option value="semantic">Semantic</option>
             <option value="lexical">Lexical</option>
           </select>
+          <label className={styles.includeSnapshots} title="Include snapshots in search">
+            <input type="checkbox" data-testid="search-include-snapshots" checked={includeSnapshots}
+              onChange={e => setIncludeSnapshots(e.target.checked)} /> +snaps
+          </label>
           <select className={styles.searchScope} aria-label="Search order"
             data-testid="search-sort" value={searchSort}
             onChange={(ev) => setSearchSort(ev.target.value as "relevance" | "modified_desc")}>

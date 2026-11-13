@@ -39,7 +39,7 @@ timeout = 3600
 listen = "127.0.0.1:3031"
 # Same semantics as `[server].authenticate` for streamable HTTP MCP tools.
 authenticate = false
-# WARNING: `full = true` registers destructive MCP tools (delete/move/rename document or directory, reindex),
+# WARNING: `full = true` registers reindex,
 # plus `whoami` and ACL/PSK admin tools (`acl_*`, `psk_*`).
 # Same authentication as JSON-RPC — trusted private / operator-controlled deployments only. Omit or false for safe default.
 # full = false

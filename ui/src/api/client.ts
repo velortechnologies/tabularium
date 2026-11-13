@@ -163,7 +163,18 @@ export async function deleteEntry(
     method: "DELETE",
   });
   if (!r.ok) {
-    throw new Error(`delete failed: ${r.status}`);
+    const body = (await r.text().catch(() => "")).trim();
+    let detail = body;
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (parsed && typeof parsed === "object" && "error" in parsed && typeof parsed.error === "string") {
+        detail = parsed.error;
+      }
+    } catch { /* Plain-text responses are also supported. */ }
+    if (r.status === 409 && detail.includes("has snapshots")) {
+      throw new Error("This document has snapshots. Open Snaps and delete them first. To delete the document and ALL its snapshots together, use tb rm -r <path> in the CLI.");
+    }
+    throw new Error(detail || `Delete failed (HTTP ${r.status}).`);
   }
 }
 
@@ -201,6 +212,7 @@ export interface SearchHit {
 export type SearchKind = "hybrid" | "semantic" | "lexical";
 
 export interface SearchDocumentsOptions {
+  includeSnapshots?: boolean;
   kind?: SearchKind;
   sort?: "relevance" | "modified_desc";
   /** Exclusive UNIX-nanosecond bounds, kept as strings to avoid JS precision loss. */
@@ -220,6 +232,7 @@ export async function searchDocuments(
   }
   const params = new URLSearchParams();
   params.set("q", q);
+  params.set("include_snapshots", String(options?.includeSnapshots ?? false));
   params.set("kind", options?.kind ?? "hybrid");
   params.set("sort", options?.sort ?? "relevance");
   if (options?.modifiedAfter) params.set("modified_after", options.modifiedAfter);

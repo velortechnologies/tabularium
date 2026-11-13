@@ -40,20 +40,12 @@ struct MetadataArg {
 
 const MCP_HELP_BASE: &str = include_str!("../res/mcp/help.txt");
 
-const TOOL_NAMES_LINE: &str = "Call tool `methods` for the live catalog; the registered set depends on config `mcp.full` (destructive tools, ACL/PSK admin tools, and `whoami` are omitted unless full mode is enabled).";
+const TOOL_NAMES_LINE: &str = "Call tool `methods` for the live catalog; the registered set depends on config `mcp.full` (reindex, ACL/PSK admin tools, and `whoami` are omitted unless full mode is enabled).";
 
 /// JSON-RPC / MCP tool names stripped when `mcp.full` is false. Each name must match a `#[tool]` on [`TabulariumMcp`].
-const MCP_FULL_ONLY_TOOL_NAMES: &[&str] = &[
-    "delete_document",
-    "delete_directory",
-    "rename_document",
-    "rename_directory",
-    "move_document",
-    "move_directory",
-    "reindex",
-];
+const MCP_FULL_ONLY_TOOL_NAMES: &[&str] = &["reindex"];
 
-/// Identity / ACL / PSK MCP tools — same gate as destructive ops (`mcp.full`).
+/// Identity / ACL / PSK MCP tools — gated by `mcp.full`.
 const MCP_FULL_ONLY_ACL_PSK_TOOL_NAMES: &[&str] = &[
     "whoami",
     "acl_list",
@@ -78,16 +70,24 @@ psk_list — (no params).
 psk_create — name (PSK handle), acl_name (string). Response includes the raw key string — use it as **`X-Auth-Key`** for authenticated MCP/RPC calls.
 psk_destroy — name (PSK handle).
 
+reindex — kind optional: lexical|semantic|hybrid (default hybrid); path optional (omit or `/` for full rebuild; subtree otherwise). Semantic requires configured embeddings and the first rebuild must be full.
+"#;
+
+const MCP_METHODS_CATALOG: &str = r#"MCP tools (parameters mirror POST /rpc JSON objects).
+
 delete_document — path (JSON-RPC delete_document).
 delete_directory — path, recursive optional (default false).
 rename_document — path, new_name.
 rename_directory — path, new_path.
 move_document — path, new_path (destination file path).
 move_directory — path, new_parent, new_name.
-reindex — kind optional: lexical|semantic|hybrid (default hybrid); path optional (omit or `/` for full rebuild; subtree otherwise). Semantic requires configured embeddings and the first rebuild must be full.
-"#;
+create_snapshot — path, name, recursive optional.
+list_snapshots — path, name optional, recursive optional.
+delete_snapshot — path, name, recursive optional.
+rollback_snapshot — path, name, recursive optional. All snapshots retained.
+rename_snapshot — path, name, new_name, recursive optional. Same source only.
+Search accepts include_snapshots (default false), for both lexical and semantic engines.
 
-const MCP_METHODS_CATALOG: &str = r#"MCP tools (parameters mirror POST /rpc JSON objects).
 
 Auth: when **`[server].authenticate = true`**, attach **`X-Auth-Key: <psk>`** on MCP HTTP requests (same as REST/`POST /rpc`), unless your proxy injects the configured OIDC assertion header. Mint keys with **`psk_create`** when **`mcp.full = true`** and admin ACL allows.
 
@@ -124,7 +124,7 @@ slice — path, start_line/end_line or from_line/to_line aliases (1-based inclus
 grep — path, pattern, max_matches optional (0 = unlimited), invert_match optional (default false). Line-level regex within that single document; not repo-wide search.
 wait — path (long-poll until document changes or server timeout).
 
-When `mcp.full = true` in server config, destructive tools plus identity / ACL / PSK admin tools (`whoami`, `acl_*`, `psk_*`) are also registered — see suffix in tool `methods` output. Otherwise use CLI or REST for those operations.
+When `mcp.full = true` in server config, reindex plus identity / ACL / PSK admin tools (`whoami`, `acl_*`, `psk_*`) are also registered — see suffix in tool `methods` output. Otherwise use CLI or REST for those operations.
 "#;
 
 #[derive(Clone)]
@@ -287,6 +287,15 @@ impl JsonSchema for Empty {
     }
 }
 
+#[derive(Deserialize, serde::Serialize, JsonSchema)]
+struct SnapshotArg {
+    path: String,
+    name: Option<String>,
+    new_name: Option<String>,
+    #[serde(default)]
+    recursive: bool,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct PathArg {
     path: String,
@@ -365,6 +374,8 @@ impl KindArg {
 
 #[derive(Deserialize, JsonSchema)]
 struct SearchArg {
+    #[serde(default)]
+    include_snapshots: bool,
     query: String,
     #[serde(default)]
     path: Option<String>,
@@ -496,6 +507,8 @@ struct RenameDirectoryArg {
 
 #[derive(Deserialize, JsonSchema)]
 struct MoveDocumentArg {
+    #[serde(default)]
+    recursive: bool,
     path: String,
     new_path: String,
 }
@@ -759,6 +772,7 @@ impl TabulariumMcp {
         Parameters(p): Parameters<SearchArg>,
     ) -> Result<String, String> {
         let mut m = Map::new();
+        m.insert("include_snapshots".into(), json!(p.include_snapshots));
         m.insert("with_status".into(), json!(true));
         if let Some(n) = p.limit {
             m.insert("limit".into(), json!(n));
@@ -972,7 +986,7 @@ Examples:
     }
 
     #[tool(
-        description = "Resolved ACL identity JSON (`whoami` RPC). **Registered only when `mcp.full = true` in server config.** Valid `X-Auth-Key` or assertion header required when `[mcp].authenticate=true`."
+        description = "Resolved ACL identity JSON (`whoami` RPC). Valid `X-Auth-Key` or assertion header required when `[mcp].authenticate=true`."
     )]
     async fn whoami(
         &self,
@@ -983,7 +997,7 @@ Examples:
     }
 
     #[tool(
-        description = "List ACL definitions (`acl_list`). **Registered only when `mcp.full = true`.** Admin ACL required when `[mcp].authenticate=true`."
+        description = "List ACL definitions (`acl_list`). Admin ACL required when `[mcp].authenticate=true`."
     )]
     async fn acl_list(
         &self,
@@ -993,9 +1007,7 @@ Examples:
         self.call_rpc_json(&parts, "acl_list", json!({})).await
     }
 
-    #[tool(
-        description = "Fetch one ACL body JSON (`acl_get`). **Registered only when `mcp.full = true`.** Admin when auth on."
-    )]
+    #[tool(description = "Fetch one ACL body JSON (`acl_get`). Admin when auth on.")]
     async fn acl_get(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1006,7 +1018,7 @@ Examples:
     }
 
     #[tool(
-        description = "Upsert ACL (`acl_put`); body must be valid ACL JSON. **Registered only when `mcp.full = true`.** Admin when auth on."
+        description = "Upsert ACL (`acl_put`); body must be valid ACL JSON. Admin when auth on."
     )]
     async fn acl_put(
         &self,
@@ -1017,9 +1029,7 @@ Examples:
             .await
     }
 
-    #[tool(
-        description = "Delete ACL and cascade keys (`acl_destroy`). **Registered only when `mcp.full = true`.** Admin when auth on."
-    )]
+    #[tool(description = "Delete ACL and cascade keys (`acl_destroy`). Admin when auth on.")]
     async fn acl_destroy(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1030,7 +1040,7 @@ Examples:
     }
 
     #[tool(
-        description = "List PSK rows (`psk_list`). **Registered only when `mcp.full = true`.** Admin when auth on. Requires `X-Auth-Key` or assertion when `[mcp].authenticate=true`."
+        description = "List PSK rows (`psk_list`). Admin when auth on. Requires `X-Auth-Key` or assertion when `[mcp].authenticate=true`."
     )]
     async fn psk_list(
         &self,
@@ -1041,7 +1051,7 @@ Examples:
     }
 
     #[tool(
-        description = "Create PSK for ACL (`psk_create`). **Registered only when `mcp.full = true`.** Admin when auth on. Returns the new key — store as `X-Auth-Key` for subsequent MCP/RPC requests when server auth is enabled."
+        description = "Create PSK for ACL (`psk_create`). Admin when auth on. Returns the new key — store as `X-Auth-Key` for subsequent MCP/RPC requests when server auth is enabled."
     )]
     async fn psk_create(
         &self,
@@ -1057,7 +1067,7 @@ Examples:
     }
 
     #[tool(
-        description = "Delete PSK (`psk_destroy`). **Registered only when `mcp.full = true`.** Admin when auth on. Requires `X-Auth-Key` or assertion when `[mcp].authenticate=true`."
+        description = "Delete PSK (`psk_destroy`). Admin when auth on. Requires `X-Auth-Key` or assertion when `[mcp].authenticate=true`."
     )]
     async fn psk_destroy(
         &self,
@@ -1068,21 +1078,93 @@ Examples:
             .await
     }
 
-    #[tool(
-        description = "Delete a file (JSON-RPC delete_document). **Registered only when `mcp.full = true` in server config.**"
-    )]
-    async fn delete_document(
+    #[tool(description = "Create named immutable snapshots. Directories require recursive=true.")]
+    async fn create_snapshot(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(p): Parameters<PathArg>,
+        Parameters(p): Parameters<SnapshotArg>,
     ) -> Result<String, String> {
-        self.call_rpc_json(&parts, "delete_document", json!({ "path": p.path }))
-            .await
+        self.call_rpc_json(
+            &parts,
+            "create_snapshot",
+            serde_json::to_value(p).map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    #[tool(description = "List snapshots of a document or directory selector.")]
+    async fn list_snapshots(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SnapshotArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(
+            &parts,
+            "list_snapshots",
+            serde_json::to_value(p).map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    #[tool(description = "Delete named snapshots, optionally recursively.")]
+    async fn delete_snapshot(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SnapshotArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(
+            &parts,
+            "delete_snapshot",
+            serde_json::to_value(p).map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    #[tool(description = "Restore any snapshot without consuming it or other snapshots.")]
+    async fn rollback_snapshot(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SnapshotArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(
+            &parts,
+            "rollback_snapshot",
+            serde_json::to_value(p).map_err(|e| e.to_string())?,
+        )
+        .await
     }
 
     #[tool(
-        description = "Delete a directory (JSON-RPC delete_directory). **Registered only when `mcp.full = true`.**"
+        description = "Rename snapshots within their source entries; recursive rename is atomic."
     )]
+    async fn rename_snapshot(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SnapshotArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(
+            &parts,
+            "rename_snapshot",
+            serde_json::to_value(p).map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    #[tool(description = "Delete a file (JSON-RPC delete_document).")]
+    async fn delete_document(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<DeleteDirectoryArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(
+            &parts,
+            "delete_document",
+            json!({ "path": p.path, "recursive": p.recursive }),
+        )
+        .await
+    }
+
+    #[tool(description = "Delete a directory (JSON-RPC delete_directory).")]
     async fn delete_directory(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1096,9 +1178,7 @@ Examples:
         .await
     }
 
-    #[tool(
-        description = "Rename a file's last segment (JSON-RPC rename_document). **Registered only when `mcp.full = true`.**"
-    )]
+    #[tool(description = "Rename a file's last segment (JSON-RPC rename_document).")]
     async fn rename_document(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1112,9 +1192,7 @@ Examples:
         .await
     }
 
-    #[tool(
-        description = "Rename/move a directory by full new_path (JSON-RPC rename_directory). **Registered only when `mcp.full = true`.**"
-    )]
+    #[tool(description = "Rename/move a directory by full new_path (JSON-RPC rename_directory).")]
     async fn rename_directory(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1128,9 +1206,7 @@ Examples:
         .await
     }
 
-    #[tool(
-        description = "Move a file to a new absolute file path (JSON-RPC move_document). **Registered only when `mcp.full = true`.**"
-    )]
+    #[tool(description = "Move a file to a new absolute file path (JSON-RPC move_document).")]
     async fn move_document(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1139,13 +1215,13 @@ Examples:
         self.call_rpc_json(
             &parts,
             "move_document",
-            json!({ "path": p.path, "new_path": p.new_path }),
+            json!({ "path": p.path, "new_path": p.new_path, "recursive": p.recursive }),
         )
         .await
     }
 
     #[tool(
-        description = "Move a directory under a new parent with a new leaf name (JSON-RPC move_directory). **Registered only when `mcp.full = true`.**"
+        description = "Move a directory under a new parent with a new leaf name (JSON-RPC move_directory)."
     )]
     async fn move_directory(
         &self,
@@ -1165,7 +1241,7 @@ Examples:
     }
 
     #[tool(
-        description = "Rebuild selected search indexes (kind=lexical|semantic|hybrid, default hybrid); optional path limits subtree. **Registered only when `mcp.full = true`.**"
+        description = "Rebuild selected search indexes (kind=lexical|semantic|hybrid, default hybrid); optional path limits subtree."
     )]
     async fn reindex(
         &self,
@@ -1188,9 +1264,9 @@ Examples:
 impl ServerHandler for TabulariumMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.mcp_full {
-            "Tabularium MCP — **trusted FULL mode**. Same JSON-RPC semantics and authentication as POST /rpc (no alternate permission model). Includes destructive tools, identity (`whoami`), and ACL/PSK admin tools — plus the standard document operations. **Private / operator-controlled deployments only.**"
+            "Tabularium MCP — **trusted FULL mode**. Same JSON-RPC semantics and authentication as POST /rpc (no alternate permission model). Includes reindex, identity (`whoami`), and ACL/PSK admin tools — plus the standard document operations. **Private / operator-controlled deployments only.**"
         } else {
-            "Tabularium MCP — filesystem-like document store for AI agents. Three operations: list_directory (tree walk / find-by-listing, rows carry modified_at), search (hybrid lexical/semantic across bodies, file names, descriptions), grep (regex lines in one file). say_document for meetings (`from_id` = sender nickname). append_document is not for chat blocks. Destructive tools and ACL/PSK/`whoami` MCP tools are not registered unless `mcp.full = true` in server config; otherwise use CLI or REST."
+            "Tabularium MCP — filesystem-like document store for AI agents. Three operations: list_directory (tree walk / find-by-listing, rows carry modified_at), search (hybrid lexical/semantic across bodies, file names, descriptions), grep (regex lines in one file). say_document for meetings (`from_id` = sender nickname). append_document is not for chat blocks. Document and snapshot deletion/movement are available subject to ACLs. Reindex and ACL/PSK/`whoami` tools are not registered unless `mcp.full = true` in server config; otherwise use CLI or REST."
         };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(instructions)

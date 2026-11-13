@@ -127,6 +127,7 @@ pub fn router(state: AppState) -> Router {
             get(rest_get_metadata).put(rest_put_metadata),
         )
         .route("/api/search", get(search_get).post(search_post))
+        .route("/api/snapshots/{operation}", post(rest_snapshots))
         .route("/api/reindex", post(rest_reindex))
         .route("/ws", get(ws_upgrade))
         .route("/rpc", post(rpc_dispatch))
@@ -137,6 +138,59 @@ pub fn router(state: AppState) -> Router {
         ))
         .with_state(state)
         .fallback(axum::routing::get(crate::embedded_ui::serve))
+}
+
+async fn authorize_snapshot_tree(
+    st: &AppState,
+    auth: &RequestAuth,
+    path: &str,
+    recursive: bool,
+) -> tabularium::Result<()> {
+    check_read(auth, path)?;
+    check_write(auth, path)?;
+    if recursive && st.db.resolve_directory_path(path).await.is_ok() {
+        let mut pending = vec![path.to_string()];
+        while let Some(directory) = pending.pop() {
+            for entry in st.db.list_directory(&directory).await? {
+                let child = join_under_directory(&directory, entry.name());
+                check_read(auth, &child)?;
+                check_write(auth, &child)?;
+                if entry.kind() == EntryKind::Dir {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// REST transport for snapshot operations, sharing RPC validation and authorization.
+async fn rest_snapshots(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(operation): Path<String>,
+    Json(params): Json<Map<String, Value>>,
+) -> ApiResult<Json<Value>> {
+    let method = match operation.as_str() {
+        "create" => "create_snapshot",
+        "list" => "list_snapshots",
+        "delete" => "delete_snapshot",
+        "rollback" => "rollback_snapshot",
+        "rename" => "rename_snapshot",
+        _ => {
+            return Err(ApiError(Error::InvalidInput(
+                "unknown snapshot operation".into(),
+            )));
+        }
+    };
+    let auth = api_resolve_auth(&st, &headers).await?;
+    dispatch_app_rpc(&st, &auth, method, params)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            RpcAppError::Other(error) => ApiError(error),
+            RpcAppError::MethodNotFound(error) => ApiError(Error::InvalidInput(error)),
+        })
 }
 
 async fn api_test(State(st): State<AppState>) -> ApiResult<Json<Value>> {
@@ -240,6 +294,8 @@ struct PutDocumentBody {
 
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
+    #[serde(default)]
+    include_snapshots: bool,
     q: String,
     #[serde(default)]
     dir: Option<String>,
@@ -262,6 +318,8 @@ struct SearchQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchPostBody {
+    #[serde(default)]
+    include_snapshots: bool,
     q: String,
     #[serde(default)]
     dir: Option<String>,
@@ -638,9 +696,18 @@ async fn rest_delete_any(
     let auth = api_resolve_auth(&st, &headers).await?;
     let canon = rest_to_canonical(&rest);
     check_write(&auth, &canon).map_err(ApiError)?;
+    if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&canon)? {
+        authorize_snapshot_tree(&st, &auth, source, q.recursive).await?;
+        st.db.delete_snapshot(source, name, q.recursive).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     match st.db.resolve_existing_file_path(&canon).await {
         Ok(fid) => {
-            st.db.delete_document(fid).await?;
+            if q.recursive {
+                st.db.delete_document_recursive(fid).await?;
+            } else {
+                st.db.delete_document(fid).await?;
+            }
             info!(
                 target: "tabularium_server::api",
                 path = %canon,
@@ -734,6 +801,7 @@ async fn search_get(
         q.limit,
         q.max_output_bytes,
         tabularium::SearchOptions {
+            include_snapshots: q.include_snapshots,
             sort: q.sort,
             modified_after: q.modified_after,
             modified_before: q.modified_before,
@@ -796,6 +864,7 @@ async fn search_post(
         b.limit,
         b.max_output_bytes,
         tabularium::SearchOptions {
+            include_snapshots: b.include_snapshots,
             sort: b.sort,
             modified_after: b.modified_after,
             modified_before: b.modified_before,
@@ -1311,11 +1380,51 @@ pub(crate) async fn dispatch_app_rpc(
             );
             Ok(json!({ "revision": meta.revision() }))
         }
+        "create_snapshot" | "list_snapshots" | "delete_snapshot" | "rollback_snapshot"
+        | "rename_snapshot" => {
+            let path = rpc_path(&m, "path")?;
+            canonical_path_segments(&path)?;
+            let recursive = m.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+            let name = m.get("name").and_then(Value::as_str);
+            if method == "list_snapshots" {
+                check_read(auth, &path)?;
+                let rows = st.db.list_snapshots(&path, name, recursive).await?;
+                let rows: Vec<_> = rows.into_iter().filter(|r| check_read(auth, r.canonical_path()).is_ok())
+                    .map(|r| json!({"id":r.id().raw(),"path":r.canonical_path(),"name":r.name().split_once('@').map(|(_,n)|n),"revision":r.revision(),"size_bytes":r.size_bytes(),"created_at":r.created_at(),"modified_at":r.modified_at(),"content_kind":r.content_kind()})).collect();
+                return Ok(json!(rows));
+            }
+            authorize_snapshot_tree(st, auth, &path, recursive).await?;
+            let name = name.ok_or_else(|| Error::InvalidInput("missing snapshot name".into()))?;
+            match method {
+                "create_snapshot" => {
+                    st.db.create_snapshot(&path, name, recursive).await?;
+                }
+                "delete_snapshot" => st.db.delete_snapshot(&path, name, recursive).await?,
+                "rollback_snapshot" => st.db.rollback_snapshot(&path, name, recursive).await?,
+                "rename_snapshot" => {
+                    st.db
+                        .rename_snapshot(&path, name, get_str(&m, "new_name")?, recursive)
+                        .await?
+                }
+                _ => unreachable!(),
+            }
+            Ok(Value::Null)
+        }
         "delete_document" => {
             let path = rpc_path(&m, "path")?;
             check_write(auth, &path).map_err(RpcAppError::Other)?;
+            let recursive = m.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+            if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&path)? {
+                authorize_snapshot_tree(st, auth, source, recursive).await?;
+                st.db.delete_snapshot(source, name, recursive).await?;
+                return Ok(Value::Null);
+            }
             let fid = st.db.resolve_existing_file_path(&path).await?;
-            st.db.delete_document(fid).await?;
+            if recursive {
+                st.db.delete_document_recursive(fid).await?;
+            } else {
+                st.db.delete_document(fid).await?;
+            }
             info!(
                 target: "tabularium_server::api",
                 method = "delete_document",
@@ -1427,6 +1536,14 @@ pub(crate) async fn dispatch_app_rpc(
         "rename_document" => {
             let path = rpc_path(&m, "path")?;
             let new_name = get_str(&m, "new_name")?;
+            if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&path)? {
+                let recursive = m.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+                authorize_snapshot_tree(st, auth, source, recursive).await?;
+                st.db
+                    .rename_snapshot(source, name, new_name, recursive)
+                    .await?;
+                return Ok(Value::Null);
+            }
             check_write(auth, &path).map_err(RpcAppError::Other)?;
             let fid = st.db.resolve_existing_file_path(&path).await?;
             let (parent, _) = tabularium::resource_path::parent_and_final_name(&path)
@@ -1440,6 +1557,28 @@ pub(crate) async fn dispatch_app_rpc(
         "move_document" => {
             let path = rpc_path(&m, "path")?;
             let new_path = rpc_path(&m, "new_path")?;
+            if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&path)? {
+                let Some((target, new_name)) =
+                    tabularium::resource_path::split_snapshot_path(&new_path)?
+                else {
+                    return Err(Error::InvalidInput(
+                        "snapshot destination must use source@name".into(),
+                    )
+                    .into());
+                };
+                if source != target {
+                    return Err(Error::InvalidInput(
+                        "cannot move snapshots between entries".into(),
+                    )
+                    .into());
+                }
+                let recursive = m.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+                authorize_snapshot_tree(st, auth, source, recursive).await?;
+                st.db
+                    .rename_snapshot(source, name, new_name, recursive)
+                    .await?;
+                return Ok(Value::Null);
+            }
             canonical_path_segments(&path)?;
             canonical_path_segments(&new_path)?;
             check_write(auth, &path).map_err(RpcAppError::Other)?;
@@ -1455,10 +1594,35 @@ pub(crate) async fn dispatch_app_rpc(
             let src = rpc_path(&m, "src")?;
             let dst = rpc_path(&m, "dst")?;
             let recursive = m.get("recursive").and_then(Value::as_bool).unwrap_or(false);
-            canonical_path_segments(&src)?;
+            if tabularium::resource_path::split_snapshot_path(&src)?.is_none() {
+                canonical_path_segments(&src)?;
+            }
             canonical_path_segments(&dst)?;
             check_read(auth, &src).map_err(RpcAppError::Other)?;
             check_write(auth, &dst).map_err(RpcAppError::Other)?;
+            if let Some((source, name)) = tabularium::resource_path::split_snapshot_path(&src)? {
+                let directory = st.db.resolve_directory_path(source).await.is_ok();
+                let root = if st.db.resolve_directory_path(&dst).await.is_ok() {
+                    join_under_directory(&dst, source.rsplit('/').next().unwrap_or(""))
+                } else {
+                    dst.clone()
+                };
+                for snapshot in st.db.list_snapshots(source, Some(name), recursive).await? {
+                    check_read(auth, snapshot.canonical_path())?;
+                    let live = snapshot.canonical_path().split_once('@').unwrap().0;
+                    let target = if directory {
+                        join_under_directory(
+                            &root,
+                            live.strip_prefix(source.trim_end_matches('/'))
+                                .unwrap()
+                                .trim_start_matches('/'),
+                        )
+                    } else {
+                        root.clone()
+                    };
+                    check_write(auth, &target)?;
+                }
+            }
             st.db.cp(&src, &dst, recursive).await?;
             Ok(Value::Null)
         }
@@ -1817,7 +1981,9 @@ pub(crate) async fn dispatch_app_rpc(
         }
         "describe" => {
             let path = rpc_path(&m, "path")?;
-            canonical_path_segments(&path)?;
+            if tabularium::resource_path::split_snapshot_path(&path)?.is_none() {
+                canonical_path_segments(&path)?;
+            }
             match m.get("description") {
                 None => {
                     check_read(auth, &path).map_err(RpcAppError::Other)?;

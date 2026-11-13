@@ -333,15 +333,18 @@ fn edit_text_in_editor(session: &mut TerminalSession, initial: &str) -> Result<S
         .map_err(|e| -> BoxErr { e.into() })?;
     tmp.flush().map_err(|e| -> BoxErr { e.into() })?;
     let tmp_path = tmp.path().to_path_buf();
-
+    let mut file = Some(tmp);
     session.suspend()?;
-    let edit_result = run_editor(&tmp_path);
-    let resume_result = session.resume();
-    resume_result?;
-    edit_result.map_err(|e| -> BoxErr { e.into() })?;
-
-    let edited = std::fs::read_to_string(tmp_path).map_err(|e| -> BoxErr { e.into() })?;
-    Ok(normalize_editor_text(edited))
+    let edit_result: Result<String, BoxErr> = (|| {
+        loop {
+            match run_editor(&tmp_path).and_then(|()| std::fs::read_to_string(&tmp_path)) {
+                Ok(edited) => return Ok(normalize_editor_text(edited)),
+                Err(error) => crate::editor::retry(&mut file, &error, false)?,
+            }
+        }
+    })();
+    session.resume()?;
+    edit_result
 }
 
 fn wrap_transcript_lines(transcript: &str, width: usize) -> Vec<String> {

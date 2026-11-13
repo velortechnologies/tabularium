@@ -207,8 +207,11 @@ impl<S: Storage> Database<S> {
     pub async fn document_stat(&self, file_id: EntryId) -> Result<(DocumentMeta, String, usize)> {
         let meta = self.storage.get_file_meta(file_id).await?;
         let parent_path = self.storage.canonical_path(meta.parent_id()).await?;
-        let content = self.get_document(file_id).await?;
-        let lines = content.lines().count();
+        let lines = if meta.is_binary() {
+            0
+        } else {
+            self.get_document(file_id).await?.lines().count()
+        };
         Ok((meta, parent_path, lines))
     }
 
@@ -285,9 +288,31 @@ impl<S: Storage> Database<S> {
             .map(str::trim)
             .filter(|p| !p.is_empty() && *p != "/")
             .map(|p| p.trim_end_matches('/'));
+        let source_scope = if options.include_snapshots {
+            match restrict_to_document {
+                Some(id) => Some(
+                    self.storage
+                        .get_file_meta(id)
+                        .await?
+                        .canonical_path()
+                        .to_string(),
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
         let scored = self
             .search
-            .search_scored(keywords, norm, restrict_to_document)
+            .search_scored(
+                keywords,
+                norm,
+                if source_scope.is_some() {
+                    None
+                } else {
+                    restrict_to_document
+                },
+            )
             .await?;
         let mut candidates = Vec::new();
         for (id, score) in scored {
@@ -297,6 +322,14 @@ impl<S: Storage> Database<S> {
                 Err(e) => return Err(e),
             };
             let path = meta.canonical_path();
+            if source_scope.as_deref().is_some_and(|source| {
+                path != source && path.split_once('@').map(|(live, _)| live) != Some(source)
+            }) {
+                continue;
+            }
+            if !options.include_snapshots && path.contains('@') {
+                continue;
+            }
             if norm.is_some_and(|p| !path.starts_with(&format!("{p}/")))
                 || auth.is_some_and(|a| a.check_read_abs(path).is_err())
                 || !options.matches_modified(meta.modified_at().as_nanos())
@@ -320,7 +353,11 @@ impl<S: Storage> Database<S> {
                 break;
             }
             let path = before.canonical_path();
-            let content = self.storage.get_file_content(id).await?;
+            let content = if before.is_binary() {
+                String::new()
+            } else {
+                self.storage.get_file_content(id).await?
+            };
             let after = self.storage.get_file_meta(id).await?;
             if before.revision() != after.revision()
                 || before.canonical_path() != after.canonical_path()
@@ -490,6 +527,9 @@ impl<S: Storage> Database<S> {
         let dst = trim_nonroot_trailing_slash(dst.as_ref());
         if src.is_empty() || src == "/" {
             return Err(Error::InvalidInput("cp: invalid source path".into()));
+        }
+        if let Some((source, name)) = crate::resource_path::split_snapshot_path(src)? {
+            return self.copy_snapshot(source, name, dst, recursive).await;
         }
         canonical_path_segments(src)?;
         canonical_path_segments(dst)?;

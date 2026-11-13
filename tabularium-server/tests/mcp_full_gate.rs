@@ -33,10 +33,24 @@ async fn test_app() -> (AppState, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn mcp_full_false_omits_destructive_tools() {
+async fn mcp_standard_registers_document_operations_but_not_admin() {
     let (app, _dir) = test_app().await;
     let mcp = TabulariumMcp::new(app, Arc::from(""), false);
-    assert!(!mcp.has_mcp_tool("delete_document"));
+    for name in [
+        "delete_document",
+        "delete_directory",
+        "move_document",
+        "move_directory",
+        "rename_document",
+        "rename_directory",
+        "create_snapshot",
+        "list_snapshots",
+        "delete_snapshot",
+        "rename_snapshot",
+        "rollback_snapshot",
+    ] {
+        assert!(mcp.has_mcp_tool(name), "{name}");
+    }
     assert!(!mcp.has_mcp_tool("reindex"));
     assert!(mcp.has_mcp_tool("get_document"));
     assert!(mcp.has_mcp_tool("list_directory"));
@@ -61,4 +75,70 @@ async fn mcp_full_true_registers_destructive_tools() {
     assert!(mcp.has_mcp_tool("acl_list"));
     assert!(mcp.has_mcp_tool("acl_destroy"));
     assert!(mcp.has_mcp_tool("psk_destroy"));
+}
+
+#[tokio::test]
+async fn standard_mcp_snapshot_lifecycle_and_search() {
+    use serde_json::{Value, json};
+    let (app, _dir) = test_app().await;
+    let mcp = TabulariumMcp::new(app, Arc::from(""), false);
+    mcp.invoke_rpc_for_test(
+        "put_document",
+        json!({"path":"/note","content":"historicalword"}),
+    )
+    .await
+    .unwrap();
+    mcp.invoke_rpc_for_test("create_snapshot", json!({"path":"/note","name":"first"}))
+        .await
+        .unwrap();
+    mcp.invoke_rpc_for_test(
+        "put_document",
+        json!({"path":"/note","content":"newword","force":true}),
+    )
+    .await
+    .unwrap();
+    let body = mcp
+        .invoke_rpc_for_test(
+            "search",
+            json!({"query":"historicalword","kind":"lexical","include_snapshots":true}),
+        )
+        .await
+        .unwrap();
+    assert!(body.contains("/note@first"), "{body}");
+    let body = mcp
+        .invoke_rpc_for_test("search", json!({"query":"historicalword","kind":"lexical"}))
+        .await
+        .unwrap();
+    assert!(!body.contains("/note@first"), "{body}");
+    mcp.invoke_rpc_for_test(
+        "rename_snapshot",
+        json!({"path":"/note","name":"first","new_name":"renamed"}),
+    )
+    .await
+    .unwrap();
+    mcp.invoke_rpc_for_test(
+        "rollback_snapshot",
+        json!({"path":"/note","name":"renamed"}),
+    )
+    .await
+    .unwrap();
+    let body = mcp
+        .invoke_rpc_for_test("get_document", json!({"path":"/note"}))
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["content"], "historicalword");
+    assert!(
+        mcp.invoke_rpc_for_test("delete_document", json!({"path":"/note"}))
+            .await
+            .is_err()
+    );
+    mcp.invoke_rpc_for_test("delete_document", json!({"path":"/note","recursive":true}))
+        .await
+        .unwrap();
+    assert!(
+        mcp.invoke_rpc_for_test("get_document", json!({"path":"/note@renamed"}))
+            .await
+            .is_err()
+    );
 }

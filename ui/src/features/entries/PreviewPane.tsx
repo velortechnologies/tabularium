@@ -32,6 +32,7 @@ import { copyTextClipboard } from "../../utils/clipboard";
 import { parentPath } from "./entryModel";
 import { withOpenDocQuery } from "./entriesPath";
 import styles from "./PreviewPane.module.scss";
+import { SnapshotManager } from "./SnapshotManager";
 import { codePreviewNodes, documentPreviewFormat } from "./documentPreview";
 
 const diagramComponents = markdownDiagramComponents();
@@ -102,6 +103,23 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const navigate = useNavigate();
     const editorRef = useRef<HTMLTextAreaElement>(null);
     const [modeParams, setModeParams] = useSearchParams();
+    const snapshot = modeParams.get("snapshot") ?? "";
+    const sourcePath = pathLabel?.split("@")[0] ?? null;
+    const [snapshots, setSnapshots] = useState<Array<{name: string}>>([]);
+    const [showSnaps, setShowSnaps] = useState(false);
+    const [snapshotsReload, setSnapshotsReload] = useState(0);
+    const [snapshotError, setSnapshotError] = useState<string | null>(null);
+    useEffect(() => {
+      let active = true;
+      setSnapshots([]);
+      setSnapshotError(null);
+      if (sourcePath) {
+        void rpcCall<Array<{name: string}>>("list_snapshots", {path: sourcePath, recursive: false})
+          .then(rows => { if (active) setSnapshots(rows); })
+          .catch((e: unknown) => { if (active) setSnapshotError(String(e)); });
+      }
+      return () => { active = false; };
+    }, [sourcePath, snapshotsReload]);
     const rawMode = modeParams.get("raw") === "1";
     const metaMode = modeParams.get("meta") === "1";
     const setModeHint = useCallback((key: string, value: boolean | ((old: boolean) => boolean)) => {
@@ -355,6 +373,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
 
     const editHintAttempted = useRef(false);
     const startEdit = useCallback(async () => {
+      if (pathLabel?.includes("@")) return;
       if (binary || pathLabel === null || saving || editLoading) {
         return;
       }
@@ -435,7 +454,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
     const showPreviewBody = !binary &&
       documentSurface === "preview" && !editMode && !metaMode && showDoc;
     const showChatBody = !binary &&
-      documentSurface === "chat" && !editMode && !metaMode && pathLabel != null;
+      !snapshot && documentSurface === "chat" && !editMode && !metaMode && pathLabel != null;
 
     return (
       <section
@@ -472,7 +491,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
               </button>
             ) : null}
           </span>
-          {showRawToggle || showChatToggle || editMode ? (
+          {pathLabel || showRawToggle || showChatToggle || editMode ? (
             <div className={styles.headerActions} data-testid="preview-actions">
               {pathLabel && !editMode ? (
                 <button type="button" className={styles.rawToggle} data-testid="preview-meta"
@@ -511,7 +530,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   type="button"
                   className={styles.chatToggle}
                   data-testid="preview-chat"
-                  disabled={binary || editLoading}
+                  disabled={!!snapshot || binary || editLoading}
                   onClick={toggleChatSurface}
                 >
                   {documentSurface === "chat" ? "Preview" : "Chat"}
@@ -546,7 +565,7 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   className={styles.editSave}
                   data-testid="preview-edit"
                   title="Edit document body"
-                  disabled={binary || editLoading || metaMode}
+                  disabled={!!snapshot || binary || editLoading || metaMode}
                   onClick={() => {
                     void startEdit();
                   }}
@@ -554,6 +573,12 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
                   {editLoading ? "Loading…" : "Edit"}
                 </button>
               )}
+              {sourcePath ? <button type="button" className={styles.rawToggle}
+                data-testid="preview-snaps" aria-expanded={showSnaps}
+                disabled={editMode || editLoading || loading}
+                onClick={() => { setShowSnaps(value => !value); setSnapshotsReload(value => value + 1); }}>
+                Snaps
+              </button> : null}
               <button
                 type="button"
                 className={styles.rawToggle}
@@ -565,9 +590,38 @@ export const PreviewPane = forwardRef<HTMLDivElement, PreviewPaneProps>(
               >
                 ⇩
               </button>
+              {pathLabel && snapshots.length > 0 ? <select aria-label="Snapshot" data-testid="preview-snapshot"
+                style={{marginLeft:"auto", textAlign:"right"}} value={snapshot}
+                disabled={editMode || loading} title={snapshotError ?? "View snapshot"}
+                onChange={e => {
+                  const value = e.target.value;
+                  setModeParams(prev => {
+                    const next = new URLSearchParams(prev);
+                    if (value) next.set("snapshot", value); else next.delete("snapshot");
+                    next.delete("edit"); next.delete("chat"); next.delete("meta");
+                    return next;
+                  });
+                }}>
+                <option value=""></option>
+                {snapshot && !snapshots.some(s => s.name === snapshot) ? <option value={snapshot}>{snapshot}</option> : null}
+                {snapshots.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+              </select> : null}
             </div>
           ) : null}
         </div>
+        {showSnaps && !editMode && !editLoading && sourcePath ? <SnapshotManager path={sourcePath} snapshots={snapshots}
+          listError={snapshotError}
+          onChanged={(action, name) => {
+            setSnapshotsReload(value => value + 1);
+            if (action === "rollback" || (action === "delete" && snapshot === name)) {
+              setModeParams(prev => {
+                const next = new URLSearchParams(prev);
+                next.delete("snapshot"); next.delete("chat"); next.delete("edit");
+                return next;
+              });
+            }
+            onDocumentSaved?.();
+          }} /> : null}
         <div
           ref={showChatBody ? undefined : ref}
           className={`${styles.body} ${editMode ? styles.bodyEditing : ""} ${showChatBody ? styles.bodyChat : ""}`}

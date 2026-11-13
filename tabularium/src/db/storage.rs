@@ -10,6 +10,27 @@ use crate::{Result, Timestamp};
 /// Async persistence for the hierarchical `entries` table (`sqlx` today, another engine tomorrow).
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn create_snapshots(
+        &self,
+        path: &str,
+        name: &str,
+        recursive: bool,
+    ) -> Result<Vec<EntryId>>;
+    async fn snapshot_ids(
+        &self,
+        path: &str,
+        name: Option<&str>,
+        recursive: bool,
+    ) -> Result<Vec<EntryId>>;
+    async fn change_snapshots(
+        &self,
+        path: &str,
+        name: &str,
+        recursive: bool,
+        action: &str,
+        new_name: Option<&str>,
+    ) -> Result<Vec<EntryId>>;
+
     async fn replace_binary_with_text(
         &self,
         file_id: EntryId,
@@ -76,6 +97,7 @@ pub trait Storage: Send + Sync {
     async fn create_file(&self, path: &str, content: impl AsRef<str> + Send) -> Result<EntryId>;
 
     async fn delete_file(&self, file_id: EntryId) -> Result<()>;
+    async fn delete_file_recursive(&self, file_id: EntryId) -> Result<Vec<EntryId>>;
 
     async fn update_file(
         &self,

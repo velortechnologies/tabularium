@@ -59,7 +59,9 @@ export function withOpenDocQuery(
 ): string {
   const path = entriesPathForDir(dirPath);
   const q = new URLSearchParams();
-  q.set("open", docAbsolutePath);
+  const at = docAbsolutePath.indexOf("@");
+  q.set("open", at < 0 ? docAbsolutePath : docAbsolutePath.slice(0, at));
+  if (at >= 0) q.set("snapshot", docAbsolutePath.slice(at + 1));
   return `${path}?${q.toString()}`;
 }
 

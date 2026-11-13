@@ -40,6 +40,11 @@ pub fn validate_entity_name(name: impl AsRef<str>) -> Result<()> {
     if name == "." || name == ".." {
         return Err(Error::InvalidInput("name must not be '.' or '..'".into()));
     }
+    if name.contains('@') {
+        return Err(Error::InvalidInput(
+            "name must not contain reserved snapshot separator @".into(),
+        ));
+    }
     if name.contains('/') {
         return Err(Error::InvalidInput("name must not contain '/'".into()));
     }
@@ -49,6 +54,20 @@ pub fn validate_entity_name(name: impl AsRef<str>) -> Result<()> {
     if name.chars().all(|c| c.is_ascii_digit()) {
         return Err(Error::InvalidInput(
             "name must not be a pure decimal number".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Snapshot names use a deliberately portable ASCII alphabet.
+pub fn validate_snapshot_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(Error::InvalidInput(
+            "snapshot name must match [A-Za-z0-9._-]+".into(),
         ));
     }
     Ok(())

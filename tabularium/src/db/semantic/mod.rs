@@ -132,6 +132,22 @@ impl SemanticIndex {
             .await?;
         Ok(())
     }
+    pub async fn forget(&self, id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for table in ["docs", "dirty"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE id = ?"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM staging_chunks WHERE doc_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// No authoritative state is changed until all embeddings have succeeded.
     pub async fn replace(
         &self,

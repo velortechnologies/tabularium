@@ -1,0 +1,6 @@
+@use "../../styles/tokens" as *;
+.panel { padding: 0.75rem; border-bottom: 1px solid $border; font-size: 0.82rem; max-height: 45%; overflow: auto; }
+.create { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; input { flex: 1; min-width: 6rem; width: auto; } }
+.table { width: 100%; border-collapse: collapse; margin-top: 0.6rem; th, td { padding: 0.35rem; text-align: left; border-bottom: 1px solid $border; overflow-wrap: anywhere; } }
+.actions { text-align: right !important; white-space: nowrap; button + button { margin-left: 0.4rem; } }
+.empty { opacity: 0.7; }

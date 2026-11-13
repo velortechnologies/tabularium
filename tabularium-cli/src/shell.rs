@@ -80,8 +80,10 @@ const SUBCOMMANDS: &[&str] = &[
     "quit",
     "reindex",
     "rm",
+    "rollback",
     "search",
     "slice",
+    "snapshot",
     "stat",
     "tail",
     "test",
@@ -95,7 +97,7 @@ const SUBCOMMANDS: &[&str] = &[
 /// Keep sorted alphabetically per the project coding-rules scroll.
 const PATH_FIRST: &[&str] = &[
     "append", "cat", "chat", "cp", "desc", "ec", "edit", "head", "less", "mv", "put", "rm",
-    "slice", "stat", "tail", "touch", "wait", "wc",
+    "rollback", "slice", "snapshot", "stat", "tail", "touch", "wait", "wc",
 ];
 
 #[cfg(test)]
@@ -1371,10 +1373,14 @@ fn should_invalidate_cache(cmd: &Command) -> bool {
 pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<Command, String> {
     Ok(match cmd {
         Command::Ls {
+            snapshot,
+            recursive,
             directory,
             sort_by_time,
             reverse,
         } => Command::Ls {
+            snapshot,
+            recursive,
             directory: resolve_ls_directory(directory.as_deref(), shell_cwd)?,
             sort_by_time,
             reverse,
@@ -1403,6 +1409,14 @@ pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<C
             path: resolve_shell_doc_path(&path, shell_cwd)?,
             file,
             force,
+        },
+        Command::Snapshot { path, recursive } => Command::Snapshot {
+            path: resolve_shell_doc_path(&path, shell_cwd)?,
+            recursive,
+        },
+        Command::Rollback { path, recursive } => Command::Rollback {
+            path: resolve_shell_doc_path(&path, shell_cwd)?,
+            recursive,
         },
         Command::Rm { path, recursive } => Command::Rm {
             path: resolve_shell_rm_path(&path, recursive, shell_cwd)?,
@@ -1486,13 +1500,19 @@ pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<C
             export,
             edit,
         },
-        Command::Edit { path } => Command::Edit {
+        Command::Edit { path, metadata } => Command::Edit {
+            metadata,
             path: resolve_shell_doc_path(&path, shell_cwd)?,
         },
         Command::Wait { path } => Command::Wait {
             path: resolve_shell_doc_path(&path, shell_cwd)?,
         },
-        Command::Mv { src, dst } => Command::Mv {
+        Command::Mv {
+            src,
+            dst,
+            recursive,
+        } => Command::Mv {
+            recursive,
             src: resolve_shell_doc_path(&src, shell_cwd)?,
             dst: resolve_shell_doc_path(&dst, shell_cwd)?,
         },
@@ -1506,6 +1526,7 @@ pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<C
             dst: resolve_shell_tree_scope(&dst, shell_cwd)?,
         },
         Command::Search {
+            include_snapshots,
             directory,
             query,
             kind,
@@ -1516,6 +1537,7 @@ pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<C
             modified_before,
             json,
         } => Command::Search {
+            include_snapshots,
             json,
             limit,
             max_output_bytes,
@@ -2152,6 +2174,8 @@ mod shell_cwd_tests {
     fn ls_fills_cwd_when_omitted() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: None,
                 sort_by_time: false,
                 reverse: false,
@@ -2165,6 +2189,8 @@ mod shell_cwd_tests {
     fn ls_bare_segment_prepends_cwd_like_cat() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: Some("other".into()),
                 sort_by_time: false,
                 reverse: false,
@@ -2178,6 +2204,8 @@ mod shell_cwd_tests {
     fn ls_dot_resolves_shell_cwd() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: Some(".".into()),
                 sort_by_time: false,
                 reverse: false,
@@ -2223,13 +2251,14 @@ mod shell_cwd_tests {
     fn mv_src_multi_segment_uses_cwd() {
         let c = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "subdir/file".into(),
                 dst: "target".into(),
             },
             Some("xxx"),
         );
         assert!(
-            matches!(c, Command::Mv { src, dst } if src == "xxx/subdir/file" && dst == "xxx/target")
+            matches!(c, Command::Mv { src, dst, .. } if src == "xxx/subdir/file" && dst == "xxx/target")
         );
     }
 
@@ -2310,38 +2339,42 @@ mod shell_cwd_tests {
     fn mv_bare_uses_cwd_at_root_directory_rename() {
         let c = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "a".into(),
                 dst: "b".into(),
             },
             Some("z"),
         );
-        assert!(matches!(c, Command::Mv { src, dst } if src == "z/a" && dst == "z/b"));
+        assert!(matches!(c, Command::Mv { src, dst, .. } if src == "z/a" && dst == "z/b"));
         let c = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "a".into(),
                 dst: "b".into(),
             },
             None,
         );
-        assert!(matches!(c, Command::Mv { src, dst } if src == "a" && dst == "b"));
+        assert!(matches!(c, Command::Mv { src, dst, .. } if src == "a" && dst == "b"));
     }
 
     #[test]
     fn mv_bare_glob_prepended_with_cwd() {
         let c = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "p*".into(),
                 dst: "q".into(),
             },
             Some("z"),
         );
-        assert!(matches!(c, Command::Mv { src, dst } if src == "z/p*" && dst == "z/q"));
+        assert!(matches!(c, Command::Mv { src, dst, .. } if src == "z/p*" && dst == "z/q"));
     }
 
     #[test]
     fn mv_dst_trailing_slash_prepends_cwd() {
         let c = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "meeting-test".into(),
                 dst: "meetings/".into(),
             },
@@ -2417,7 +2450,13 @@ mod shell_cwd_tests {
                 "c/d",
             ),
             (Command::Ec { path: "d".into() }, "c/d"),
-            (Command::Edit { path: "d".into() }, "c/d"),
+            (
+                Command::Edit {
+                    metadata: false,
+                    path: "d".into(),
+                },
+                "c/d",
+            ),
             (Command::Wait { path: "d".into() }, "c/d"),
             (Command::Less { path: "d".into() }, "c/d"),
             (
@@ -2438,7 +2477,7 @@ mod shell_cwd_tests {
             | Command::Stat { path: p }
             | Command::Wc { path: p, .. }
             | Command::Ec { path: p }
-            | Command::Edit { path: p }
+            | Command::Edit { path: p, .. }
             | Command::Wait { path: p }
             | Command::Less { path: p }
             | Command::Desc { path: p, .. }) = out
@@ -2501,6 +2540,7 @@ mod shell_cwd_tests {
     fn search_directory_optional_strips_leading_slash() {
         let s = unwrap_ac(
             Command::Search {
+                include_snapshots: false,
                 json: false,
                 limit: None,
                 max_output_bytes: None,
@@ -2523,6 +2563,7 @@ mod shell_cwd_tests {
         ));
         let s2 = unwrap_ac(
             Command::Search {
+                include_snapshots: false,
                 json: false,
                 limit: None,
                 max_output_bytes: None,
@@ -2538,6 +2579,7 @@ mod shell_cwd_tests {
         assert!(matches!(s2, Command::Search { directory: Some(ref x), .. } if x == "notes"));
         let s3 = unwrap_ac(
             Command::Search {
+                include_snapshots: false,
                 json: false,
                 limit: None,
                 max_output_bytes: None,
@@ -2557,6 +2599,7 @@ mod shell_cwd_tests {
     fn search_dot_directory_resolves_cwd() {
         let s = unwrap_ac(
             Command::Search {
+                include_snapshots: false,
                 json: false,
                 limit: None,
                 max_output_bytes: None,
@@ -2672,6 +2715,8 @@ mod shell_cwd_tests {
     fn ls_slash_at_root_lists_repository_root() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: Some("/".into()),
                 sort_by_time: false,
                 reverse: false,
@@ -2685,6 +2730,8 @@ mod shell_cwd_tests {
     fn ls_slash_inside_cwd_lists_repository_root() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: Some("/".into()),
                 sort_by_time: false,
                 reverse: false,
@@ -2698,6 +2745,8 @@ mod shell_cwd_tests {
     fn ls_slash_other_strips_prefix() {
         let c = unwrap_ac(
             Command::Ls {
+                snapshot: false,
+                recursive: false,
                 directory: Some("/other".into()),
                 sort_by_time: false,
                 reverse: false,
@@ -2840,6 +2889,7 @@ mod shell_cwd_tests {
             ),
             (
                 Command::Edit {
+                    metadata: false,
                     path: "/c/d".into(),
                 },
                 "c/d",
@@ -2866,7 +2916,7 @@ mod shell_cwd_tests {
             | Command::Stat { path: p }
             | Command::Wc { path: p, .. }
             | Command::Ec { path: p }
-            | Command::Edit { path: p }
+            | Command::Edit { path: p, .. }
             | Command::Wait { path: p }
             | Command::Less { path: p }) = out
             else {
@@ -2933,12 +2983,13 @@ mod shell_cwd_tests {
         assert!(matches!(g, Command::Grep { path, .. } if path == "c/d"));
         let m = unwrap_ac(
             Command::Mv {
+                recursive: false,
                 src: "/a/b".into(),
                 dst: "/c/d".into(),
             },
             Some("z"),
         );
-        assert!(matches!(m, Command::Mv { src, dst } if src == "a/b" && dst == "c/d"));
+        assert!(matches!(m, Command::Mv { src, dst, .. } if src == "a/b" && dst == "c/d"));
     }
 }
 

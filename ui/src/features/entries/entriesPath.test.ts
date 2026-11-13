@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  withOpenDocQuery,
   entriesUrlFromLibrariumPathname,
   librariumTargetFromPathname,
 } from "./entriesPath.ts";
@@ -67,4 +68,11 @@ test("splits a librarium path into parent and name", () => {
     name: "README",
   });
   assert.equal(librariumTargetFromPathname("/"), null);
+});
+
+test("snapshot hits split live path and snapshot query parameter", () => {
+  const url = new URL(withOpenDocQuery("/docs", "/docs/note@release-1"), "http://test");
+  assert.equal(url.searchParams.get("open"), "/docs/note");
+  assert.equal(url.searchParams.get("snapshot"), "release-1");
+  assert.equal(new URL(withOpenDocQuery("/docs", "/docs/note"), "http://test").searchParams.has("snapshot"), false);
 });

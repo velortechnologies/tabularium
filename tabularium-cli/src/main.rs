@@ -2,6 +2,7 @@
 
 mod chat_markdown;
 mod chat_tui;
+mod editor;
 mod execute;
 mod render;
 mod shell;
@@ -149,7 +150,11 @@ pub(crate) enum Command {
     /// Edit in `$EDITOR`, then open `chat` on the same path (new paths: no server write until the buffer differs from empty).
     Ec { path: String },
     /// Edit document in `$EDITOR` (`DIR/FILE`).
-    Edit { path: String },
+    Edit {
+        #[arg(long)]
+        metadata: bool,
+        path: String,
+    },
     /// JSON metadata: show by default, or --import FILE, --export FILE, --edit ($EDITOR).
     Meta {
         path: String,
@@ -213,6 +218,12 @@ pub(crate) enum Command {
     /// List entries under a directory (files and subdirectories); omit path to list `/`.
     #[command(visible_alias = "l", visible_alias = "ll")]
     Ls {
+        /// List named snapshots instead of live entries.
+        #[arg(long)]
+        snapshot: bool,
+        /// Include descendants when listing snapshots.
+        #[arg(short = 'R', long)]
+        recursive: bool,
         /// Sort by modified time (newest first; combine with `-r` for oldest first, GNU `ls -tr` style).
         #[arg(short = 't', long = "time")]
         sort_by_time: bool,
@@ -241,7 +252,24 @@ pub(crate) enum Command {
         path: String,
     },
     /// Move or rename a directory or file (`mv SRC DST`).
-    Mv { src: String, dst: String },
+    Mv {
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        src: String,
+        dst: String,
+    },
+    /// Create named snapshots; directories require -r.
+    Snapshot {
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        path: String,
+    },
+    /// Restore named snapshots, retaining all snapshot history.
+    Rollback {
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        path: String,
+    },
     /// Create a named PSK for an ACL (`psk_create`): `NAME` (globally unique) then `ACL`.
     #[command(name = "psk-create")]
     PskCreate { name: String, acl_name: String },
@@ -282,6 +310,9 @@ pub(crate) enum Command {
     },
     /// Hybrid lexical/semantic search (`search` RPC; path walk: `find`; line-regex: `grep`).
     Search {
+        /// Include historical snapshots in lexical and semantic results.
+        #[arg(long)]
+        include_snapshots: bool,
         /// Print the complete structured report including revisions and truncation status.
         #[arg(long)]
         json: bool,
@@ -403,7 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(execute::ExecuteOutcome::Interrupted) => std::process::exit(130),
                 Err(e) => {
                     execute::print_cli_message(&e.to_string());
-                    std::process::exit(1);
+                    std::process::exit(if e.downcast_ref::<editor::Cancelled>().is_some() {
+                        130
+                    } else {
+                        1
+                    });
                 }
             }
         }
@@ -493,6 +528,7 @@ mod cli_parse_tests {
             sort_by_time,
             reverse,
             directory,
+            ..
         } = c.command
         else {
             panic!("expected ls");
@@ -509,6 +545,7 @@ mod cli_parse_tests {
             sort_by_time,
             reverse,
             directory,
+            ..
         } = c.command
         else {
             panic!("expected ls");

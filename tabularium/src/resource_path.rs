@@ -62,6 +62,13 @@ pub fn normalize_path_for_rpc(path: impl AsRef<Path>) -> Result<String> {
     } else {
         format!("/{}", s.trim_start_matches('/'))
     };
+    if let Some((source, name)) = with_leading.split_once('@') {
+        crate::validation::validate_snapshot_name(name)?;
+        return Ok(format!(
+            "{}@{name}",
+            lexical_normalize_absolute_path(source)?
+        ));
+    }
     lexical_normalize_absolute_path(&with_leading)
 }
 
@@ -127,6 +134,16 @@ pub fn parent_and_final_name(path: &str) -> Result<(String, String)> {
     let name = segs[segs.len() - 1].clone();
     let parent = format!("/{}", segs[..segs.len() - 1].join("/"));
     Ok((parent, name))
+}
+
+/// Split a snapshot reference, validating both its live path and portable name.
+pub fn split_snapshot_path(path: &str) -> Result<Option<(&str, &str)>> {
+    let Some((source, name)) = path.split_once('@') else {
+        return Ok(None);
+    };
+    canonical_path_segments(source)?;
+    crate::validation::validate_snapshot_name(name)?;
+    Ok(Some((source, name)))
 }
 
 #[cfg(test)]

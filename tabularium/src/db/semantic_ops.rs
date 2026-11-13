@@ -200,8 +200,30 @@ impl<S: Storage> Database<S> {
             .semantic
             .as_ref()
             .ok_or_else(|| Error::Search("semantic search is not configured".into()))?;
+        let source_scope = if options.include_snapshots {
+            match only {
+                Some(id) => Some(
+                    self.storage
+                        .get_file_meta(id)
+                        .await?
+                        .canonical_path()
+                        .to_string(),
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
         let candidates = index
-            .candidates(query, path, only.map(EntryId::raw))
+            .candidates(
+                query,
+                path,
+                if source_scope.is_some() {
+                    None
+                } else {
+                    only.map(EntryId::raw)
+                },
+            )
             .await?;
         // Rank authorized current metadata before reading source bodies.
         let mut eligible = Vec::new();
@@ -212,6 +234,15 @@ impl<S: Storage> Database<S> {
                 Err(e) => return Err(e),
             };
             let current_path = meta.canonical_path();
+            if source_scope.as_deref().is_some_and(|source| {
+                current_path != source
+                    && current_path.split_once('@').map(|(live, _)| live) != Some(source)
+            }) {
+                continue;
+            }
+            if !options.include_snapshots && current_path.contains('@') {
+                continue;
+            }
             if meta.revision() != Some(c.revision.as_str())
                 || !options.matches_modified(meta.modified_at().as_nanos())
                 || auth.is_some_and(|a| a.check_read_abs(current_path).is_err())

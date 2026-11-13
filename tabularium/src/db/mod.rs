@@ -1,5 +1,6 @@
 //! Database facade: `Storage` + Tantivy + read-through cache (`moka`).
 mod blob;
+mod snapshots;
 
 mod entry_kind;
 mod meta;
@@ -134,7 +135,7 @@ impl SqliteDatabase {
         let storage = SqliteStorage::connect(db_uri.as_ref()).await?;
         let search = SearchIndex::open(index_path.as_ref())?;
         let cache = Cache::builder().max_capacity(cache_size.max(1)).build();
-        Ok(Database {
+        let db = Database {
             storage,
             search,
             semantic: None,
@@ -142,7 +143,12 @@ impl SqliteDatabase {
             cache_active: cache_size > 0,
             doc_wait: Arc::new(DashMap::new()),
             doc_append_locks: Arc::new(DashMap::new()),
-        })
+        };
+        if db.storage.snapshot_reindex_required().await? {
+            db.reindex(None).await?;
+            db.storage.snapshot_reindex_finished().await?;
+        }
+        Ok(db)
     }
 
     pub async fn acl_list_rows(&self) -> Result<Vec<(String, String)>> {
@@ -399,7 +405,9 @@ impl<S: Storage> Database<S> {
     #[instrument(skip(self), fields(path = %path.as_ref()), err(Debug))]
     pub async fn entry_description(&self, path: impl AsRef<str> + Send) -> Result<Option<String>> {
         let path = path.as_ref();
-        canonical_path_segments(path)?;
+        if crate::resource_path::split_snapshot_path(path)?.is_none() {
+            canonical_path_segments(path)?;
+        }
         self.storage.entry_description(path).await
     }
 
@@ -432,9 +440,7 @@ impl<S: Storage> Database<S> {
         let rows = self.storage.files_for_search_reindex(Some(path)).await?;
         self.storage.delete_directory_recursive(path).await?;
         for (id, _, _, _, _) in rows {
-            self.search.delete_file(id).await?;
-            self.queue_semantic(id).await;
-            self.cache.invalidate(&id).await;
+            self.forget_snapshot_index(id).await?;
             self.doc_wait.remove(&id);
         }
         Ok(())
@@ -587,6 +593,10 @@ impl<S: Storage> Database<S> {
             .move_file(file_id, new_parent_path.as_ref(), new_name.as_ref())
             .await?;
         self.reindex_file_in_search(file_id).await?;
+        let path = self.storage.canonical_path(file_id).await?;
+        for snapshot in self.storage.snapshot_ids(&path, None, false).await? {
+            self.reindex_file_in_search(snapshot).await?;
+        }
         self.cache.invalidate(&file_id).await;
         Ok(())
     }
@@ -604,6 +614,10 @@ impl<S: Storage> Database<S> {
         validate_entity_name(new_name.as_ref())?;
         self.storage.rename_file(file_id, new_name.as_ref()).await?;
         self.reindex_file_in_search(file_id).await?;
+        let path = self.storage.canonical_path(file_id).await?;
+        for snapshot in self.storage.snapshot_ids(&path, None, false).await? {
+            self.reindex_file_in_search(snapshot).await?;
+        }
         self.cache.invalidate(&file_id).await;
         Ok(())
     }
@@ -714,7 +728,16 @@ impl<S: Storage> Database<S> {
                 Some(t.trim_end_matches('/'))
             }
         });
-        self.search.search(keywords, norm).await
+        let ids = self.search.search(keywords, norm).await?;
+        let mut live = Vec::new();
+        for id in ids {
+            match self.storage.get_file_meta(id).await {
+                Ok(meta) if !meta.canonical_path().contains('@') => live.push(id),
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(live)
     }
 
     #[instrument(skip(self), fields(directory = ?directory_path_filter), err(Debug))]

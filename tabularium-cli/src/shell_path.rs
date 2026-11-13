@@ -24,7 +24,12 @@ fn fold_parts(base: &mut Vec<String>, parts: &[&str]) -> Result<(), String> {
                     .ok_or_else(|| "path escapes repository root".to_string())?;
             }
             seg => {
-                validate_entity_name(seg).map_err(|e| e.to_string())?;
+                if let Some((entry, snapshot)) = seg.split_once('@') {
+                    validate_entity_name(entry).map_err(|e| e.to_string())?;
+                    tabularium::validate_snapshot_name(snapshot).map_err(|e| e.to_string())?;
+                } else {
+                    validate_entity_name(seg).map_err(|e| e.to_string())?;
+                }
                 base.push(seg.to_string());
             }
         }

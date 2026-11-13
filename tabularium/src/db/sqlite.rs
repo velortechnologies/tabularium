@@ -15,6 +15,8 @@ use crate::resource_path::{canonical_path_segments, parent_and_final_name};
 use crate::validation::validate_entity_name;
 use crate::{Error, Result};
 
+mod snapshots;
+
 const ROOT_ID: i64 = 1;
 
 async fn table_exists(pool: &SqlitePool, name: &str) -> Result<bool> {
@@ -293,13 +295,24 @@ impl SqliteStorage {
             .max_connections(5)
             .connect_with(opts)
             .await?;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        if version > 1 {
+            return Err(Error::InvalidInput(format!(
+                "unsupported database schema {version}"
+            )));
+        }
         migrate(&pool).await?;
+        snapshots::migrate(&pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS browser_sessions (token_hash TEXT PRIMARY KEY, psk_id INTEGER NOT NULL REFERENCES access_keys(id) ON DELETE CASCADE)")
             .execute(&pool).await?;
-        Ok(Self {
+        let storage = Self {
             pool,
             blobs: super::blob::BlobStore::new(blob_root),
-        })
+        };
+        storage.recover_blob_cleanup().await?;
+        Ok(storage)
     }
 
     async fn text_write_failure(&self, file_id: EntryId) -> Result<()> {
@@ -517,7 +530,7 @@ async fn canonical_path_for_id(pool: &SqlitePool, entry_id: EntryId) -> Result<S
     let names: Vec<String> = sqlx::query_scalar(
         r"
         WITH RECURSIVE up AS (
-            SELECT id, parent_id, name, 0 AS lvl FROM entries WHERE id = ?
+            SELECT id, parent_id, name, 0 AS lvl FROM readable_entries WHERE id = ?
             UNION ALL
             SELECT e.id, e.parent_id, e.name, up.lvl + 1
             FROM entries e
@@ -587,6 +600,56 @@ enum MkdirParentsScan {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn delete_file_recursive(&self, file_id: EntryId) -> Result<Vec<EntryId>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM snapshots WHERE source_id = ?")
+            .bind(file_id.raw())
+            .fetch_all(&mut *tx)
+            .await?;
+        let blobs: Vec<String> = sqlx::query_scalar("SELECT blob_revision FROM snapshots WHERE source_id = ? AND blob_revision IS NOT NULL UNION SELECT blob_revision FROM entries WHERE id = ? AND blob_revision IS NOT NULL")
+            .bind(file_id.raw()).bind(file_id.raw()).fetch_all(&mut *tx).await?;
+        let changed = sqlx::query("DELETE FROM entries WHERE id = ? AND kind = 1")
+            .bind(file_id.raw())
+            .execute(&mut *tx)
+            .await?;
+        if changed.rows_affected() == 0 {
+            return Err(Error::NotFound(file_id.to_string()));
+        }
+        tx.commit().await?;
+        for blob in blobs {
+            self.remove_unreferenced_blob(file_id, &blob).await?;
+        }
+        Ok(ids.into_iter().map(EntryId::from).collect())
+    }
+
+    async fn create_snapshots(
+        &self,
+        path: &str,
+        name: &str,
+        recursive: bool,
+    ) -> Result<Vec<EntryId>> {
+        self.create_snapshots_impl(path, name, recursive).await
+    }
+    async fn snapshot_ids(
+        &self,
+        path: &str,
+        name: Option<&str>,
+        recursive: bool,
+    ) -> Result<Vec<EntryId>> {
+        self.snapshot_ids_impl(path, name, recursive).await
+    }
+    async fn change_snapshots(
+        &self,
+        path: &str,
+        name: &str,
+        recursive: bool,
+        action: &str,
+        new_name: Option<&str>,
+    ) -> Result<Vec<EntryId>> {
+        self.change_snapshots_impl(path, name, recursive, action, new_name)
+            .await
+    }
+
     async fn replace_binary_with_text(
         &self,
         file_id: EntryId,
@@ -616,7 +679,7 @@ impl Storage for SqliteStorage {
             .execute(&mut *tx).await?;
         tx.commit().await?;
         if let Some(generation) = generation {
-            self.blobs.remove(file_id, &generation)?;
+            self.remove_unreferenced_blob(file_id, &generation).await?;
         }
         Ok(())
     }
@@ -673,7 +736,7 @@ impl Storage for SqliteStorage {
         // On uncertain commit failure retain the new generation; never remove a potentially live blob.
         tx.commit().await?;
         if let Some(old) = old_generation {
-            self.blobs.remove(id.into(), &old)?;
+            self.remove_unreferenced_blob(id.into(), &old).await?;
         }
         Ok(id.into())
     }
@@ -682,7 +745,7 @@ impl Storage for SqliteStorage {
         // Serialize open with replacement/delete until the OS file handle is acquired.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let generation: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT blob_revision FROM entries WHERE id = ? AND content_kind = 1",
+            "SELECT blob_revision FROM readable_entries WHERE id = ? AND content_kind = 1",
         )
         .bind(file_id.raw())
         .fetch_optional(&mut *tx)
@@ -690,9 +753,13 @@ impl Storage for SqliteStorage {
         let generation = generation
             .flatten()
             .ok_or_else(|| Error::NotFound(file_id.to_string()))?;
-        let row = sqlx::query("SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256 FROM entries WHERE id = ?")
+        let row = sqlx::query("SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256 FROM readable_entries WHERE id = ?")
             .bind(file_id.raw()).fetch_one(&mut *tx).await?;
-        let file = std::fs::File::open(self.blobs.path(file_id, &generation)?)?;
+        let source: i64 = sqlx::query_scalar("SELECT source_id FROM readable_entries WHERE id = ?")
+            .bind(file_id.raw())
+            .fetch_one(&mut *tx)
+            .await?;
+        let file = std::fs::File::open(self.blobs.path(source.into(), &generation)?)?;
         let path = canonical_path_for_id(&self.pool, file_id).await?;
         let meta = row_to_file_meta(&row, path)?;
         tx.commit().await?;
@@ -700,11 +767,12 @@ impl Storage for SqliteStorage {
     }
 
     async fn file_metadata(&self, file_id: EntryId) -> Result<serde_json::Value> {
-        let raw: Option<String> =
-            sqlx::query_scalar("SELECT metadata_json FROM entries WHERE id = ? AND kind = 1")
-                .bind(file_id.raw())
-                .fetch_optional(&self.pool)
-                .await?;
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM readable_entries WHERE id = ? AND kind = 1",
+        )
+        .bind(file_id.raw())
+        .fetch_optional(&self.pool)
+        .await?;
         let raw = raw.ok_or_else(|| Error::NotFound(format!("file {}", file_id.raw())))?;
         serde_json::from_str(&raw).map_err(|e| Error::InvalidInput(format!("stored metadata: {e}")))
     }
@@ -727,6 +795,9 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn touch(&self, file_id: EntryId) -> Result<()> {
+        if self.is_snapshot(file_id).await? {
+            return Ok(());
+        }
         let now = Timestamp::now();
         let r = sqlx::query("UPDATE entries SET accessed_at = ? WHERE id = ? AND kind = 1")
             .bind(now)
@@ -742,6 +813,22 @@ impl Storage for SqliteStorage {
     /// `NotFound` is normal when probing file-vs-directory (REST `get_or_list`); omit `err(Debug)` to avoid ERROR spam.
     #[instrument(skip(self), fields(path = %path, expected_kind = ?expected_kind))]
     async fn resolve_path(&self, path: &str, expected_kind: Option<EntryKind>) -> Result<EntryId> {
+        if let Some((source, name)) = crate::resource_path::split_snapshot_path(path)? {
+            if expected_kind == Some(EntryKind::Dir) {
+                return Err(Error::NotFound(path.into()));
+            }
+            let segs = canonical_path_segments(source)?;
+            let source_id = resolve_path_id(&self.pool, &segs, Some(EntryKind::File)).await?;
+            let id: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM snapshots WHERE source_id = ? AND name = ?")
+                    .bind(source_id.raw())
+                    .bind(name)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            return id
+                .map(EntryId::from)
+                .ok_or_else(|| Error::NotFound(path.into()));
+        }
         let segs = canonical_path_segments(path)?;
         resolve_path_id(&self.pool, &segs, expected_kind).await
     }
@@ -754,7 +841,7 @@ impl Storage for SqliteStorage {
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn parent_dir_path_for_file(&self, file_id: EntryId) -> Result<String> {
         let parent: i64 =
-            sqlx::query_scalar("SELECT parent_id FROM entries WHERE id = ? AND kind = 1")
+            sqlx::query_scalar("SELECT parent_id FROM readable_entries WHERE id = ? AND kind = 1")
                 .bind(file_id.raw())
                 .fetch_optional(&self.pool)
                 .await?
@@ -900,6 +987,9 @@ impl Storage for SqliteStorage {
             .bind(id.raw()).fetch_all(&mut *tx).await?;
         let mut blobs = Vec::new();
         for eid in ids {
+            let historical: Vec<String> = sqlx::query_scalar("SELECT DISTINCT blob_revision FROM snapshots WHERE source_id = ? AND blob_revision IS NOT NULL")
+                .bind(eid).fetch_all(&mut *tx).await?;
+            blobs.extend(historical.into_iter().map(|generation| (eid, generation)));
             let generation: Option<String> =
                 sqlx::query_scalar("SELECT blob_revision FROM entries WHERE id = ?")
                     .bind(eid)
@@ -915,7 +1005,8 @@ impl Storage for SqliteStorage {
         }
         tx.commit().await?;
         for (id, generation) in blobs {
-            self.blobs.remove(id.into(), &generation)?;
+            self.remove_unreferenced_blob(id.into(), &generation)
+                .await?;
         }
         Ok(())
     }
@@ -988,13 +1079,23 @@ impl Storage for SqliteStorage {
         let Some(generation) = generation else {
             return Err(Error::NotFound(file_id.to_string()));
         };
+        let has_snapshots: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM snapshots WHERE source_id = ?)")
+                .bind(file_id.raw())
+                .fetch_one(&mut *tx)
+                .await?;
+        if has_snapshots {
+            return Err(Error::NotEmpty(
+                "Cannot delete document: it has snapshots. Delete the snapshots first, or use tb rm -r <path> to delete the document and ALL its snapshots.".into(),
+            ));
+        }
         sqlx::query("DELETE FROM entries WHERE id = ?")
             .bind(file_id.raw())
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         if let Some(generation) = generation {
-            self.blobs.remove(file_id, &generation)?;
+            self.remove_unreferenced_blob(file_id, &generation).await?;
         }
         Ok(())
     }
@@ -1172,11 +1273,12 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn get_file_content(&self, file_id: EntryId) -> Result<String> {
-        let row: Option<(i64, String)> =
-            sqlx::query_as("SELECT content_kind, content FROM entries WHERE id = ? AND kind = 1")
-                .bind(file_id.raw())
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT content_kind, content FROM readable_entries WHERE id = ? AND kind = 1",
+        )
+        .bind(file_id.raw())
+        .fetch_optional(&self.pool)
+        .await?;
         match row {
             Some((0, content)) => Ok(content),
             Some(_) => Err(Error::BinaryEntry(file_id.to_string())),
@@ -1234,7 +1336,7 @@ impl Storage for SqliteStorage {
     async fn get_file_meta(&self, file_id: EntryId) -> Result<DocumentMeta> {
         let row = sqlx::query(
             r"SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256
-            FROM entries WHERE id = ? AND kind = 1",
+            FROM readable_entries WHERE id = ? AND kind = 1",
         )
         .bind(file_id.raw())
         .fetch_optional(&self.pool)
@@ -1254,7 +1356,8 @@ impl Storage for SqliteStorage {
         }
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(CHUNK) {
-            let mut qb = QueryBuilder::new("SELECT id FROM entries WHERE kind = 1 AND id IN (");
+            let mut qb =
+                QueryBuilder::new("SELECT id FROM readable_entries WHERE kind = 1 AND id IN (");
             {
                 let mut sep = qb.separated(", ");
                 for id in chunk {
@@ -1267,7 +1370,7 @@ impl Storage for SqliteStorage {
                 let id = EntryId::from_raw(row.try_get::<i64, _>(0)?);
                 let path = canonical_path_for_id(&self.pool, id).await?;
                 let content: String =
-                    sqlx::query_scalar("SELECT content FROM entries WHERE id = ?")
+                    sqlx::query_scalar("SELECT content FROM readable_entries WHERE id = ?")
                         .bind(id.raw())
                         .fetch_one(&self.pool)
                         .await?;
@@ -1279,10 +1382,12 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn file_parent_and_content(&self, file_id: EntryId) -> Result<(EntryId, String)> {
-        let row = sqlx::query("SELECT parent_id, content FROM entries WHERE id = ? AND kind = 1")
-            .bind(file_id.raw())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT parent_id, content FROM readable_entries WHERE id = ? AND kind = 1",
+        )
+        .bind(file_id.raw())
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(row) = row else {
             return Err(Error::NotFound(format!("file {}", file_id.raw())));
         };
@@ -1298,7 +1403,7 @@ impl Storage for SqliteStorage {
     ) -> Result<Vec<(EntryId, String, String, String, String)>> {
         let file_ids: Vec<i64> = match directory_path_filter {
             None => {
-                sqlx::query_scalar("SELECT id FROM entries WHERE kind = 1")
+                sqlx::query_scalar("SELECT id FROM readable_entries WHERE kind = 1")
                     .fetch_all(&self.pool)
                     .await?
             }
@@ -1313,7 +1418,7 @@ impl Storage for SqliteStorage {
                         JOIN sub ON e.parent_id = sub.id
                         WHERE e.id != e.parent_id
                     )
-                    SELECT id FROM entries WHERE kind = 1 AND id IN (SELECT id FROM sub)
+                    SELECT id FROM readable_entries WHERE kind = 1 AND source_id IN (SELECT id FROM sub)
                     ",
                 )
                 .bind(dir_id.raw())
@@ -1326,7 +1431,7 @@ impl Storage for SqliteStorage {
             let id = EntryId::from_raw(raw);
             let parent = self.parent_dir_path_for_file(id).await?;
             let row = sqlx::query(
-                "SELECT name, trim(coalesce(description, '') || ' ' || metadata_json), content FROM entries WHERE id = ? AND kind = 1",
+                "SELECT name, trim(coalesce(description, '') || ' ' || metadata_json), content FROM readable_entries WHERE id = ? AND kind = 1",
             )
             .bind(raw)
             .fetch_one(&self.pool)
@@ -1345,7 +1450,7 @@ impl Storage for SqliteStorage {
     ) -> Result<(String, String, String, String)> {
         let dp = self.parent_dir_path_for_file(file_id).await?;
         let row =
-            sqlx::query("SELECT name, trim(coalesce(description, '') || ' ' || metadata_json), content FROM entries WHERE id = ? AND kind = 1")
+            sqlx::query("SELECT name, trim(coalesce(description, '') || ' ' || metadata_json), content FROM readable_entries WHERE id = ? AND kind = 1")
                 .bind(file_id.raw())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -1462,10 +1567,11 @@ impl Storage for SqliteStorage {
     #[instrument(skip(self), fields(path = %path), err(Debug))]
     async fn entry_description(&self, path: &str) -> Result<Option<String>> {
         let id = self.resolve_path(path, None).await?;
-        let d: Option<String> = sqlx::query_scalar("SELECT description FROM entries WHERE id = ?")
-            .bind(id.raw())
-            .fetch_one(&self.pool)
-            .await?;
+        let d: Option<String> =
+            sqlx::query_scalar("SELECT description FROM readable_entries WHERE id = ?")
+                .bind(id.raw())
+                .fetch_one(&self.pool)
+                .await?;
         Ok(d)
     }
 
@@ -1611,6 +1717,9 @@ mod tests {
             .await
             .unwrap();
         let before = storage.get_file_meta(id).await.unwrap();
+        // Model a pre-snapshot database before dropping legacy columns.
+        sqlx::raw_sql("DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
+            .execute(&storage.pool).await.unwrap();
         for name in ["content_kind", "sha256", "blob_revision"] {
             sqlx::query(&format!("ALTER TABLE entries DROP COLUMN {name}"))
                 .execute(&storage.pool)
@@ -1619,6 +1728,8 @@ mod tests {
         }
         super::migrate(&storage.pool).await.unwrap();
         super::migrate(&storage.pool).await.unwrap();
+        super::snapshots::migrate(&storage.pool).await.unwrap();
+        super::snapshots::migrate(&storage.pool).await.unwrap();
         assert_eq!(
             storage.get_file_content(id).await.unwrap(),
             "unchanged UTF-8: пташка"
@@ -1651,12 +1762,17 @@ mod tests {
             .await
             .unwrap();
         let before = storage.get_file_meta(id).await.unwrap();
+        // Model a pre-snapshot database before dropping legacy columns.
+        sqlx::raw_sql("DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
+            .execute(&storage.pool).await.unwrap();
         sqlx::query("ALTER TABLE entries DROP COLUMN metadata_json")
             .execute(&storage.pool)
             .await
             .unwrap();
         super::migrate(&storage.pool).await.unwrap();
         super::migrate(&storage.pool).await.unwrap();
+        super::snapshots::migrate(&storage.pool).await.unwrap();
+        super::snapshots::migrate(&storage.pool).await.unwrap();
         assert_eq!(
             storage.file_metadata(id).await.unwrap(),
             serde_json::json!({})
@@ -1723,6 +1839,7 @@ mod tests {
             .await
             .unwrap();
         migrate(&pool).await.unwrap();
+        super::snapshots::migrate(&pool).await.unwrap();
         let now = Timestamp::now();
         let id_a: i64 = sqlx::query_scalar(
             r"INSERT INTO entries (parent_id, kind, name, description, content, size, created_at, modified_at, accessed_at)
