@@ -3871,7 +3871,7 @@ dependencies = [
 
 [[package]]
 name = "tabularium"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "axum",
@@ -3900,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "tabularium-cli"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "bma-ts",
@@ -3926,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "tabularium-server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "base64 0.22.1",
