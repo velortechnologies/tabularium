@@ -9,7 +9,7 @@ use rmcp::{
     ServerHandler,
     handler::server::tool::Extension,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
     transport::{
         StreamableHttpServerConfig,
@@ -1262,13 +1262,13 @@ Examples:
 
 #[tool_handler]
 impl ServerHandler for TabulariumMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let instructions = if self.mcp_full {
             "Tabularium MCP — **trusted FULL mode**. Same JSON-RPC semantics and authentication as POST /rpc (no alternate permission model). Includes reindex, identity (`whoami`), and ACL/PSK admin tools — plus the standard document operations. **Private / operator-controlled deployments only.**"
         } else {
             "Tabularium MCP — filesystem-like document store for AI agents. Three operations: list_directory (tree walk / find-by-listing, rows carry modified_at), search (hybrid lexical/semantic across bodies, file names, descriptions), grep (regex lines in one file). say_document for meetings (`from_id` = sender nickname). append_document is not for chat blocks. Document and snapshot deletion/movement are available subject to ACLs. Reindex and ACL/PSK/`whoami` tools are not registered unless `mcp.full = true` in server config; otherwise use CLI or REST."
         };
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(instructions)
     }
 }
@@ -1305,8 +1305,12 @@ pub async fn serve(
     let service = StreamableHttpService::new(
         move || Ok(template.clone()),
         Arc::new(LocalSessionManager::default()),
+        // Preserve trusted-network compatibility, as in EVA: arbitrary Host/Origin
+        // and no new transport-level 4 MiB limit (application limits still apply).
         StreamableHttpServerConfig::default()
             .disable_allowed_hosts()
+            .disable_allowed_origins()
+            .with_max_request_body_bytes(usize::MAX)
             .with_cancellation_token(cancel),
     );
     let router = Router::new().nest_service("/mcp", service);

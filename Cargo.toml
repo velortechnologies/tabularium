@@ -9,3 +9,7 @@ version = "0.1.10"
 
 [profile.release]
 strip = true
+
+# Keep SQLx 0.8 API compatibility while using the patched SQLite bindings.
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

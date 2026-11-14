@@ -1,4 +1,4 @@
-//! Chat TUI for `tb chat` using `ratatui` + `tui-textarea`.
+//! Chat TUI for `tb chat` using `ratatui` + `ratatui-textarea`.
 
 use std::io::{Write, stdout};
 
@@ -19,10 +19,10 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
+use ratatui_textarea::TextArea;
 use tabularium::rpc::Client as RpcClient;
 use tabularium::ws::{Client, RecvMessage};
 use tempfile::Builder;
-use tui_textarea::TextArea;
 
 use crate::chat_markdown::markdown_transcript_text;
 use crate::execute::{
@@ -820,6 +820,27 @@ pub(crate) async fn run_chat(
 #[cfg(test)]
 mod tests {
     use super::{canonical_prompt, wrap_transcript_lines};
+
+    #[test]
+    fn textarea_accepts_backend_keys_and_renders_multiline_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut textarea = super::new_textarea();
+        textarea.input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        textarea.insert_newline();
+        textarea.insert_str("second line");
+        assert_eq!(super::textarea_message(&textarea), "a\nsecond line");
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(&textarea, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..30).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).starts_with('a'));
+        assert!(row(1).starts_with("second line"));
+    }
 
     #[test]
     fn preserves_blank_lines_for_markdown_chat() {

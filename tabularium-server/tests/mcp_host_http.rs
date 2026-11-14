@@ -1,4 +1,4 @@
-//! MCP `mcp.full` tool registration (safe vs trusted full surface).
+//! Trusted-network MCP compatibility: arbitrary Host/Origin and large requests.
 
 #![cfg(feature = "mcp")]
 
@@ -34,7 +34,7 @@ async fn test_app() -> (AppState, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn non_loopback_host_accepts_initialize() {
+async fn trusted_network_transport_accepts_hosts_origins_and_large_requests() {
     let (app, _dir) = test_app().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -57,16 +57,23 @@ async fn non_loopback_host_accepts_initialize() {
     let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
         "protocolVersion":"2025-03-26","capabilities":{},
         "clientInfo":{"name":"host-regression","version":"1"}}});
-    let denied = client
+    let arbitrary_host = client
         .post(&url)
         .header("Host", "other.review.invalid")
+        .header("Origin", "https://external-client.example")
         .header("Accept", "application/json, text/event-stream")
         .json(&init)
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), reqwest::StatusCode::OK);
-    assert!(denied.text().await.unwrap().contains("protocolVersion"));
+    assert_eq!(arbitrary_host.status(), reqwest::StatusCode::OK);
+    assert!(
+        arbitrary_host
+            .text()
+            .await
+            .unwrap()
+            .contains("protocolVersion")
+    );
     let allowed = client
         .post(&url)
         .header("Host", "tb.review.invalid")
@@ -77,6 +84,22 @@ async fn non_loopback_host_accepts_initialize() {
         .unwrap();
     assert_eq!(allowed.status(), reqwest::StatusCode::OK);
     let body = allowed.text().await.unwrap();
+    assert!(body.contains("protocolVersion"), "{body}");
+    // rmcp 3.x defaults to a 4 MiB request cap; preserve the previous transport policy.
+    let mut large_init = init.clone();
+    large_init["params"]["clientInfo"]["name"] =
+        serde_json::Value::String("x".repeat(4 * 1024 * 1024 + 1));
+    let large = client
+        .post(&url)
+        .header("Host", "large.review.invalid")
+        .header("Origin", "https://another-client.example")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&large_init)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(large.status(), reqwest::StatusCode::OK);
+    let body = large.text().await.unwrap();
     assert!(body.contains("protocolVersion"), "{body}");
     cancel.cancel();
     task.abort();

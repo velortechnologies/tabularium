@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
-use tantivy::schema::document::OwnedValue;
+use tantivy::schema::Value;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
 use tracing::instrument;
@@ -307,7 +307,7 @@ impl SearchIndex {
         let top = searcher
             .search(
                 &q,
-                &TopDocs::with_limit((searcher.num_docs() as usize).max(1)),
+                &TopDocs::with_limit((searcher.num_docs() as usize).max(1)).order_by_score(),
             )
             .map_err(|e| Error::Search(e.to_string()))?;
         let mut out = Vec::with_capacity(top.len());
@@ -315,7 +315,7 @@ impl SearchIndex {
             let d: TantivyDocument = searcher
                 .doc(addr)
                 .map_err(|e| Error::Search(e.to_string()))?;
-            let Some(OwnedValue::U64(id)) = d.get_first(self.f_doc_id).cloned() else {
+            let Some(id) = d.get_first(self.f_doc_id).and_then(|value| value.as_u64()) else {
                 return Err(Error::Search("missing doc_id in indexed document".into()));
             };
             out.push((
@@ -344,5 +344,62 @@ mod dir_path_regex_tests {
         assert!(!re.is_match("/a/b"));
         assert!(!re.is_match("/a/bc"));
         assert!(!re.is_match("/a/b_other"));
+    }
+}
+
+#[cfg(test)]
+mod legacy_index_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_and_updates_tantivy_022_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tantivy-0.22.1");
+        for entry in std::fs::read_dir(fixture).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != "README.md" {
+                std::fs::copy(entry.path(), temp.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let index = SearchIndex::open(temp.path()).unwrap();
+        let mut ids = index.search("legacytoken", None).await.unwrap();
+        ids.sort_by_key(|id| id.raw());
+        assert_eq!(ids, vec![EntryId::from(1), EntryId::from(2)]);
+        assert_eq!(
+            index.search("legacytoken", Some("/one")).await.unwrap(),
+            vec![EntryId::from(1)]
+        );
+        assert!(index.search("deletedtoken", None).await.unwrap().is_empty());
+        index
+            .upsert_file(EntryId::from(1), "/one", "legacy.md", "", "newtoken")
+            .await
+            .unwrap();
+        index.delete_file(EntryId::from(2)).await.unwrap();
+        assert!(index.search("legacytoken", None).await.unwrap().is_empty());
+        assert_eq!(
+            index.search("newtoken", None).await.unwrap(),
+            vec![EntryId::from(1)]
+        );
+        drop(index);
+        let reopened = SearchIndex::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened.search("newtoken", None).await.unwrap(),
+            vec![EntryId::from(1)]
+        );
+        reopened
+            .replace_all_from_rows(&[(
+                EntryId::from(4),
+                "/rebuilt".into(),
+                "rebuilt.md".into(),
+                "".into(),
+                "rebuilttoken".into(),
+            )])
+            .await
+            .unwrap();
+        assert!(reopened.search("newtoken", None).await.unwrap().is_empty());
+        assert_eq!(
+            reopened.search("rebuilttoken", None).await.unwrap(),
+            vec![EntryId::from(4)]
+        );
     }
 }

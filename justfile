@@ -60,7 +60,12 @@ tag:
     git tag -a v{{VERSION}} -m v{{VERSION}}
     git push origin --tags
 
-release: deb pub-deb pub-docker tag publush-cargo-crate
+# Block the entire release before builds or publishing on any audit finding.
+release: audit deb pub-deb pub-docker tag publush-cargo-crate
+
+# Warnings (unmaintained, unsound, yanked, etc.) are release blockers too.
+audit:
+    cargo audit --deny warnings
 
 publush-cargo-crate:
     cargo publish -p tabularium

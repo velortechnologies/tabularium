@@ -1,0 +1,11 @@
+[package]
+name = "tantivy-legacy-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone test-data generator, not a workspace/runtime dependency.
+[workspace]
+
+[dependencies]
+tantivy = "=0.22.1"

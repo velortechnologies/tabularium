@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
+crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 filetime = "0.2"
 futures-util = "0.3"
 homedir = "0.3.6"
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 regex = "1"
 rustyline = "17.0.1"
 serde_json = "1"
@@ -25,12 +25,12 @@ tempfile = "3"
 termimad = "0.34"
 terminal_size = "0.4"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt", "signal", "time"] }
-tui-textarea = "0.7"
+ratatui-textarea = "0.9.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
-bma-ts = "0.2.6"
+bma-ts = "0.2.7"
 tabularium-server = { path = "../tabularium-server" }
