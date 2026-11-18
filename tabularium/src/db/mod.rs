@@ -139,7 +139,17 @@ impl SqliteDatabase {
         cache_size: u64,
     ) -> Result<Self> {
         let storage = SqliteStorage::connect(db_uri.as_ref()).await?;
+        let existing_index = index_path.as_ref().join("meta.json").exists();
         let search = SearchIndex::open(index_path.as_ref())?;
+        let identity_path = index_path.as_ref().join("index-identity");
+        let identity = if existing_index && identity_path.exists() {
+            fs_err::read_to_string(&identity_path)?
+        } else {
+            let identity = uuid::Uuid::new_v4().to_string();
+            fs_err::write(&identity_path, &identity)?;
+            identity
+        };
+        storage.sync_index_identity(false, &identity).await?;
         let cache = Cache::builder().max_capacity(cache_size.max(1)).build();
         let db = Database {
             storage,

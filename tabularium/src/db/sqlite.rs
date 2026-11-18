@@ -241,6 +241,86 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Derived state is in the source database so invalidation commits with mutations.
+async fn indexing_flags_schema(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::raw_sql(r"
+CREATE TABLE IF NOT EXISTS entry_index_state (
+ id INTEGER PRIMARY KEY,
+ generation INTEGER NOT NULL DEFAULT 0,
+ lexical_indexed INTEGER NOT NULL DEFAULT 0 CHECK(lexical_indexed IN (0,1)),
+ semantic_indexed INTEGER NOT NULL DEFAULT 0 CHECK(semantic_indexed IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_pending_lexical ON entry_index_state(id) WHERE lexical_indexed=0;
+CREATE INDEX IF NOT EXISTS idx_pending_semantic ON entry_index_state(id) WHERE semantic_indexed=0;
+INSERT OR IGNORE INTO entry_index_state(id) SELECT id FROM entries WHERE kind=1;
+INSERT OR IGNORE INTO entry_index_state(id) SELECT id FROM snapshots;
+CREATE TRIGGER IF NOT EXISTS index_entry_insert AFTER INSERT ON entries WHEN NEW.kind=1
+BEGIN INSERT INTO entry_index_state(id) VALUES(NEW.id); END;
+CREATE TRIGGER IF NOT EXISTS index_snapshot_insert AFTER INSERT ON snapshots
+BEGIN INSERT INTO entry_index_state(id) VALUES(NEW.id); END;
+CREATE TRIGGER IF NOT EXISTS index_entry_delete AFTER DELETE ON entries
+BEGIN DELETE FROM entry_index_state WHERE id=OLD.id; END;
+CREATE TRIGGER IF NOT EXISTS index_snapshot_delete AFTER DELETE ON snapshots
+BEGIN DELETE FROM entry_index_state WHERE id=OLD.id; END;
+CREATE TRIGGER IF NOT EXISTS index_entry_change
+AFTER UPDATE OF revision,content,metadata_json,description,name,parent_id,content_kind ON entries
+BEGIN
+ UPDATE entry_index_state SET generation=generation+1,lexical_indexed=0,semantic_indexed=0
+ WHERE id=NEW.id OR ((NEW.name IS NOT OLD.name OR NEW.parent_id IS NOT OLD.parent_id) AND id IN (
+ WITH RECURSIVE subtree(id) AS (
+ SELECT NEW.id UNION ALL SELECT e.id FROM entries e JOIN subtree s ON e.parent_id=s.id WHERE e.id!=e.parent_id
+ ) SELECT id FROM subtree UNION ALL SELECT id FROM snapshots WHERE source_id IN (SELECT id FROM subtree)
+ ));
+END;
+CREATE TRIGGER IF NOT EXISTS index_snapshot_change
+AFTER UPDATE OF revision,metadata_json,description,name,content_kind ON snapshots
+BEGIN UPDATE entry_index_state SET generation=generation+1,lexical_indexed=0,semantic_indexed=0 WHERE id=NEW.id; END;
+").execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn index_candidates_sql(kind: crate::SearchKind, missing: bool, semantic: bool) -> String {
+    let flags = match (missing, kind, semantic) {
+        (false, _, _) => "SELECT * FROM entry_index_state",
+        (true, crate::SearchKind::Lexical, _) | (true, crate::SearchKind::Hybrid, false) => {
+            "SELECT * FROM entry_index_state INDEXED BY idx_pending_lexical WHERE lexical_indexed=0"
+        }
+        (true, crate::SearchKind::Semantic, true) => {
+            "SELECT * FROM entry_index_state INDEXED BY idx_pending_semantic WHERE semantic_indexed=0"
+        }
+        (true, crate::SearchKind::Semantic, false) => "SELECT * FROM entry_index_state WHERE 0",
+        (true, crate::SearchKind::Hybrid, true) => {
+            "SELECT * FROM entry_index_state INDEXED BY idx_pending_lexical WHERE lexical_indexed=0 UNION SELECT * FROM entry_index_state INDEXED BY idx_pending_semantic WHERE semantic_indexed=0"
+        }
+    };
+    let eligibility = if missing && kind == crate::SearchKind::Semantic {
+        "d.content_kind=0"
+    } else if missing && kind == crate::SearchKind::Hybrid && semantic {
+        "(f.lexical_indexed=0 OR d.content_kind=0)"
+    } else {
+        "1"
+    };
+    // No readable_entries view here: snapshot bodies must never be joined/read.
+    format!(
+        r"
+WITH RECURSIVE flags AS MATERIALIZED ({flags}), dirs(id,path) AS (
+ SELECT ?, ? UNION ALL
+ SELECT e.id, rtrim(dirs.path,'/') || '/' || e.name FROM entries e JOIN dirs ON e.parent_id=dirs.id
+ WHERE e.kind=0 AND e.id!=e.parent_id
+), documents AS (
+ SELECT e.id, rtrim(dirs.path,'/') || '/' || e.name AS path,e.content_kind
+ FROM entries e JOIN dirs ON e.parent_id=dirs.id WHERE e.kind=1
+ UNION ALL
+ SELECT s.id, rtrim(dirs.path,'/') || '/' || e.name || '@' || s.name,s.content_kind
+ FROM snapshots s JOIN entries e ON e.id=s.source_id JOIN dirs ON dirs.id=e.parent_id
+)
+SELECT d.id,d.path,f.generation,f.lexical_indexed,f.semantic_indexed,d.content_kind
+FROM flags f JOIN documents d ON d.id=f.id WHERE {eligibility} ORDER BY d.id"
+    )
+}
+
 /// SQLite implementation of [`Storage`].
 pub struct SqliteStorage {
     pool: SqlitePool,
@@ -305,6 +385,7 @@ impl SqliteStorage {
         }
         migrate(&pool).await?;
         snapshots::migrate(&pool).await?;
+        indexing_flags_schema(&pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS browser_sessions (token_hash TEXT PRIMARY KEY, psk_id INTEGER NOT NULL REFERENCES access_keys(id) ON DELETE CASCADE)")
             .execute(&pool).await?;
         let storage = Self {
@@ -604,6 +685,87 @@ enum MkdirParentsScan {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn index_candidates(
+        &self,
+        path: &str,
+        kind: crate::SearchKind,
+        missing: bool,
+        semantic: bool,
+    ) -> Result<Vec<(EntryId, String, i64, bool, bool, bool)>> {
+        let root = self.resolve_path(path, Some(EntryKind::Dir)).await?;
+        let query = index_candidates_sql(kind, missing, semantic);
+        let rows: Vec<(i64, String, i64, bool, bool, bool)> = sqlx::query_as(&query)
+            .bind(root.raw())
+            .bind(path)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, p, g, l, s, b)| (EntryId::from_raw(id), p, g, l, s, b))
+            .collect())
+    }
+    async fn index_generation(&self, id: EntryId) -> Result<(i64, bool, bool)> {
+        sqlx::query_as(
+            "SELECT generation,lexical_indexed,semantic_indexed FROM entry_index_state WHERE id=?",
+        )
+        .bind(id.raw())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| Error::NotFound(id.to_string()))
+    }
+    async fn mark_indexed(&self, id: EntryId, generation: i64, semantic: bool) -> Result<()> {
+        let query = if semantic {
+            "UPDATE entry_index_state SET semantic_indexed=1 WHERE id=? AND generation=?"
+        } else {
+            "UPDATE entry_index_state SET lexical_indexed=1 WHERE id=? AND generation=?"
+        };
+        sqlx::query(query)
+            .bind(id.raw())
+            .bind(generation)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn prepare_index(&self, id: EntryId, semantic: bool) -> Result<()> {
+        let query = if semantic {
+            "UPDATE entry_index_state SET semantic_indexed=0 WHERE id=?"
+        } else {
+            "UPDATE entry_index_state SET lexical_indexed=0 WHERE id=?"
+        };
+        sqlx::query(query)
+            .bind(id.raw())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn sync_index_identity(&self, semantic: bool, identity: &str) -> Result<()> {
+        let key = if semantic {
+            "semantic_identity"
+        } else {
+            "lexical_identity"
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let old: Option<String> = sqlx::query_scalar("SELECT value FROM storage_state WHERE key=?")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if old.as_deref() != Some(identity) {
+            let query = if semantic {
+                "UPDATE entry_index_state SET semantic_indexed=0,generation=generation+1"
+            } else {
+                "UPDATE entry_index_state SET lexical_indexed=0,generation=generation+1"
+            };
+            sqlx::query(query).execute(&mut *tx).await?;
+            sqlx::query("INSERT OR REPLACE INTO storage_state(key,value) VALUES(?,?)")
+                .bind(key)
+                .bind(identity)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn delete_file_recursive(&self, file_id: EntryId) -> Result<Vec<EntryId>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM snapshots WHERE source_id = ?")
@@ -1719,7 +1881,7 @@ mod tests {
             .unwrap();
         let before = storage.get_file_meta(id).await.unwrap();
         // Model a pre-snapshot database before dropping legacy columns.
-        sqlx::raw_sql("DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
+        sqlx::raw_sql("DROP TRIGGER index_entry_insert; DROP TRIGGER index_entry_change; DROP TRIGGER index_entry_delete; DROP TABLE entry_index_state; DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
             .execute(&storage.pool).await.unwrap();
         for name in ["content_kind", "sha256", "blob_revision"] {
             sqlx::query(&format!("ALTER TABLE entries DROP COLUMN {name}"))
@@ -1764,7 +1926,7 @@ mod tests {
             .unwrap();
         let before = storage.get_file_meta(id).await.unwrap();
         // Model a pre-snapshot database before dropping legacy columns.
-        sqlx::raw_sql("DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
+        sqlx::raw_sql("DROP TRIGGER index_entry_insert; DROP TRIGGER index_entry_change; DROP TRIGGER index_entry_delete; DROP TABLE entry_index_state; DROP VIEW readable_entries; DROP TRIGGER snapshot_preserve_text; DROP TRIGGER snapshot_content_cleanup; DROP TRIGGER snapshot_blob_gc; DROP TRIGGER entry_blob_gc_update; DROP TRIGGER entry_blob_gc_delete; DROP TABLE blob_gc; DROP TABLE snapshots; DROP TABLE snapshot_contents; DROP TABLE storage_state; PRAGMA user_version=0;")
             .execute(&storage.pool).await.unwrap();
         sqlx::query("ALTER TABLE entries DROP COLUMN metadata_json")
             .execute(&storage.pool)
@@ -1878,3 +2040,6 @@ mod tests {
         assert_eq!(root.raw(), ROOT_ID);
     }
 }
+
+#[cfg(test)]
+mod flag_tests;

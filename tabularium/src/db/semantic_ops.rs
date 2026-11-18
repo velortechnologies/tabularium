@@ -40,7 +40,11 @@ impl<S: Storage> Database<S> {
         config: SemanticConfig,
         default_dir: &Path,
     ) -> Result<Self> {
-        self.semantic = Some(Arc::new(SemanticIndex::open(config, default_dir).await?));
+        let index = SemanticIndex::open(config, default_dir).await?;
+        self.storage
+            .sync_index_identity(true, &index.identity().await?)
+            .await?;
+        self.semantic = Some(Arc::new(index));
         Ok(self)
     }
     pub(super) async fn semantic_document(&self, id: EntryId) -> Result<SemanticDocument> {

@@ -67,38 +67,55 @@ impl<S: Storage> Database<S> {
                 "semantic search is not configured".into(),
             ));
         }
-        let path = (options.path != "/").then_some(options.path.as_str());
-        let rows = self.storage.files_for_search_reindex(path).await?;
-        let mut ids = Vec::with_capacity(rows.len());
-        for (id, _, _, _, _) in rows {
-            let missing = if options.non_indexed_only {
-                match self.document_index_state(id).await {
-                    Ok(state) => state.missing(options.indexer_kind),
-                    Err(error) if document_error(&error) => {
-                        tracing::warn!(file_id=%id, %error, "reindex selection skipping document");
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                true
-            };
-            if missing {
-                ids.push(id);
-            }
-        }
-        ids.sort_by_key(|id| id.raw());
-        Ok(ids)
+        Ok(self
+            .storage
+            .index_candidates(
+                &options.path,
+                options.indexer_kind,
+                options.non_indexed_only,
+                self.semantic.is_some(),
+            )
+            .await?
+            .into_iter()
+            .map(|r| r.0)
+            .collect())
     }
     pub async fn reindex_explain(
         &self,
         options: &ReindexOptions,
     ) -> Result<Vec<super::IndexState>> {
-        let mut result = Vec::new();
-        for id in self.selected_ids(options).await? {
-            result.push(self.document_index_state(id).await?);
+        crate::resource_path::canonical_path_segments(&options.path)?;
+        if options.indexer_kind == SearchKind::Semantic && self.semantic.is_none() {
+            return Err(Error::InvalidInput(
+                "semantic search is not configured".into(),
+            ));
         }
-        Ok(result)
+        Ok(self
+            .storage
+            .index_candidates(
+                &options.path,
+                options.indexer_kind,
+                options.non_indexed_only,
+                self.semantic.is_some(),
+            )
+            .await?
+            .into_iter()
+            .map(
+                |(_, path, _, lexical, semantic, binary)| super::IndexState {
+                    path,
+                    lexical: if lexical { "ready" } else { "pending" },
+                    semantic: if self.semantic.is_none() {
+                        "disabled"
+                    } else if binary {
+                        "not_applicable"
+                    } else if semantic {
+                        "ready"
+                    } else {
+                        "pending"
+                    },
+                },
+            )
+            .collect())
     }
     pub fn reindex_jobs(&self) -> Vec<ReindexJob> {
         let jobs = self
@@ -386,6 +403,34 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn explain_never_starts_jobs_or_indexes_pending_documents() {
+        let (_temp, db) = database().await;
+        let id = db
+            .storage
+            .create_file("/pending", "not indexed")
+            .await
+            .unwrap();
+        let before = db.storage.index_generation(id).await.unwrap();
+        let _guard = db.indexing.mutex.lock().await;
+        for missing in [false, true] {
+            let mut selection = options();
+            selection.non_indexed_only = missing;
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), db.reindex_explain(&selection))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].path, "/pending");
+            assert_eq!(result[0].lexical, "pending");
+            tokio::task::yield_now().await;
+            assert!(db.reindex_jobs().is_empty());
+            assert_eq!(db.indexing.active(), 0);
+            assert_eq!(db.storage.index_generation(id).await.unwrap(), before);
+        }
+    }
+
     #[tokio::test]
     async fn stop_waiting_job_and_atomic_auto_dedup() {
         let (_temp, db) = database().await;

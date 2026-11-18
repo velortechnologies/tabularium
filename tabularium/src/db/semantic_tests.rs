@@ -942,3 +942,28 @@ async fn time_slice_allows_api_write_to_pass_large_job() {
     assert_eq!(db.indexing.active(), 0);
     endpoint.abort();
 }
+
+#[tokio::test]
+async fn failed_forced_reindex_clears_persistent_semantic_flag() {
+    let (url, offline, task) = mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), &url).await;
+    let id = db.storage.create_file("/doc", "backup").await.unwrap();
+    db.inline_index(id).await;
+    assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
+    offline.store(true, Ordering::SeqCst);
+    assert!(
+        db.reindex_selected("/", SearchKind::Semantic, false)
+            .await
+            .is_err()
+    );
+    let state = db.document_index_state(id).await.unwrap();
+    assert_eq!(state.lexical, "ready");
+    assert_eq!(state.semantic, "pending");
+    offline.store(false, Ordering::SeqCst);
+    db.reindex_selected("/", SearchKind::Semantic, true)
+        .await
+        .unwrap();
+    assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
+    task.abort();
+}

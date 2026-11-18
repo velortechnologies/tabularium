@@ -10,6 +10,20 @@ use crate::{Result, Timestamp};
 /// Async persistence for the hierarchical `entries` table (`sqlx` today, another engine tomorrow).
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Persistent flags selected without reading document bodies. Tuple: id, path,
+    /// generation, lexical indexed, semantic indexed, binary eligibility.
+    async fn index_candidates(
+        &self,
+        path: &str,
+        kind: crate::SearchKind,
+        missing: bool,
+        semantic: bool,
+    ) -> Result<Vec<(EntryId, String, i64, bool, bool, bool)>>;
+    async fn index_generation(&self, id: EntryId) -> Result<(i64, bool, bool)>;
+    async fn mark_indexed(&self, id: EntryId, generation: i64, semantic: bool) -> Result<()>;
+    async fn prepare_index(&self, id: EntryId, semantic: bool) -> Result<()>;
+    async fn sync_index_identity(&self, semantic: bool, identity: &str) -> Result<()>;
+
     async fn create_snapshots(
         &self,
         path: &str,

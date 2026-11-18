@@ -1,4 +1,4 @@
-//! Rebuildable SQLite semantic sidecar. The authoritative document DB is never migrated.
+//! Rebuildable SQLite semantic sidecar; persistent flags live in source storage.
 
 mod chunk;
 mod client;
@@ -63,6 +63,17 @@ impl SemanticIndex {
             client,
         })
     }
+    pub async fn identity(&self) -> Result<String> {
+        sqlx::query("INSERT OR IGNORE INTO meta(key,value) VALUES('instance',?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(format!(
+            "{}:{}",
+            self.meta("instance").await?.unwrap_or_default(),
+            self.config.fingerprint()
+        ))
+    }
     async fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT value FROM meta WHERE key=?")
             .bind(key)
@@ -112,24 +123,6 @@ impl SemanticIndex {
         Ok(sqlx::query_scalar("SELECT id FROM docs")
             .fetch_all(&self.pool)
             .await?)
-    }
-    pub async fn matches(&self, doc: &SemanticDocument) -> Result<bool> {
-        if matches!(self.state().await?, "unindexed" | "incompatible") {
-            return Ok(false);
-        }
-        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dirty WHERE id=?)")
-            .bind(doc.id)
-            .fetch_one(&self.pool)
-            .await?;
-        if pending {
-            return Ok(false);
-        }
-        let value: Option<(String, String)> =
-            sqlx::query_as("SELECT path,revision FROM docs WHERE id=?")
-                .bind(doc.id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(value.is_some_and(|(p, r)| p == doc.path && r == doc.revision))
     }
     pub async fn forget(&self, id: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;

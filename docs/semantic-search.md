@@ -10,12 +10,18 @@ Without `[semantic]`, default hybrid remains lexical-only and works with old dat
 
 ## Storage and upgrade
 
-- `tabularium.db` remains authoritative; its schema is not changed by this feature.
+- `tabularium.db` remains authoritative. Persistent indexing flags are stored in this database; see the one-time upgrade step below.
 - `tabularium.index` remains the Tantivy directory.
 - A separate sibling `tabularium.semantic.index/semantic.db` stores derived vectors, exact byte/line coordinates, document revisions, model/preprocessing identity. It is disposable and reconstructible. Treat it as private data like the source database.
 - Initial upgrade: add optional `[semantic]` configuration, restart, run `tb reindex job start / --indexer-kind semantic` once. Plain `tb reindex job start /` rebuilds both configured engines.
 - Model ID/revision, prefixes, normalization or chunk settings changing require a full semantic rebuild, not a migration. Pin the provider model version with `model_revision`; alias-only model changes on a remote server cannot be reliably detected when dimensions stay equal.
 - Moving the same inference model between CPU and GPU does not require a new client or database layout.
+
+**Persistent-flags upgrade:** all existing documents initially becoming `pending`
+is normal. Existing indexes and documents are preserved. Run
+`tb reindex job start / --non-indexed-only` once for all enabled indexers, then
+verify no pending work remains. See [upgrade instructions](reindex-jobs.md#upgrade-one-time-reindex-for-persistent-flags)
+for monitoring, failure recovery and `auto_reindex` behavior.
 
 Reindex is a server-owned background job, independent of the API connection. Writes index inline and log indexing failures without failing a successful source write. See [reindex jobs](reindex-jobs.md) for job lifecycle, cancellation, state, configuration and recovery. Commits happen per document; partial progress is retained on failure.
 

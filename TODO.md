@@ -95,9 +95,10 @@ This replaces the previous durable-job/outbox and queued-reindex proposal.
 
 ### Per-document index state and reconciliation
 
-- Track lexical and semantic indexed revisions separately against the current
-  entry revision. Missing/mismatching revisions mean pending/stale; expose
-  ready / pending / error per engine.
+- Persist separate lexical_indexed and semantic_indexed flags in the source
+  database, transactionally invalidated by document changes. Use generation
+  checks for completion and partial SQL indexes for pending selection.
+  Explain must not read bodies or recompute hashes.
 - Document changes invalidate the corresponding indexed state. Mark a revision
   indexed only after successful index commit. Use revision/generation checks
   so an old job cannot mark a newer document revision indexed.
