@@ -93,7 +93,7 @@ impl AssertionRuntime {
             match decode::<Value>(token, &dk, &validation) {
                 Ok(t) => return Ok(t.claims),
                 Err(e) => {
-                    debug!(target: "tabularium_server::oidc", err=%e, "JWK trial decode failed")
+                    debug!(target: "tabularium_server::oidc", err=%e, "JWK trial decode failed");
                 }
             }
         }

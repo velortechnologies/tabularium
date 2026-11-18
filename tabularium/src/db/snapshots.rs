@@ -58,11 +58,7 @@ impl<S: Storage> Database<S> {
     }
 
     pub(super) async fn forget_snapshot_index(&self, id: EntryId) -> Result<()> {
-        self.search.delete_file(id).await?;
-        if let Some(index) = &self.semantic {
-            let _guard = index.operation.lock().await;
-            index.forget(id.raw()).await?;
-        }
+        self.remove_from_indexes(id).await?;
         self.cache.invalidate(&id).await;
         Ok(())
     }

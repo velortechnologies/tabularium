@@ -169,7 +169,7 @@ fn flags_for(sub: &str) -> &'static [&'static str] {
         "export" => &["-d", "--destination"],
         "find" => &["-d", "--directory"],
         "search" => &["-d", "--directory", "--kind"],
-        "reindex" => &["--kind"],
+        "reindex" => &["--indexer-kind", "--non-indexed-only"],
         "grep" => &["-m", "-v", "--invert-match"],
         "head" => &["-n", "--raw"],
         "wc" => &["-l", "-w", "-c", "-m", "-r", "--recursive"],
@@ -985,12 +985,13 @@ impl Completer for TbHelper {
                 return Ok((pos, p));
             }
             if sub == "reindex" {
-                let mut p = vec![Pair {
-                    display: "/".into(),
-                    replacement: "/ ".into(),
-                }];
-                p.extend(self.complete_path(&mut state, ""));
-                return Ok((pos, p));
+                return Ok((
+                    pos,
+                    vec![Pair {
+                        display: "job".into(),
+                        replacement: "job ".into(),
+                    }],
+                ));
             }
             if matches!(sub, "acl-edit" | "acl-destroy" | "acl-get")
                 && words.len() == 1
@@ -1127,9 +1128,14 @@ impl Completer for TbHelper {
         }
 
         if matches!(sub, "search" | "reindex") {
-            let kind_partial = if ends_with_space && words.last().copied() == Some("--kind") {
+            let kind_partial = if ends_with_space
+                && matches!(words.last().copied(), Some("--kind" | "--indexer-kind"))
+            {
                 Some("")
-            } else if !ends_with_space && words.len() >= 3 && words[words.len() - 2] == "--kind" {
+            } else if !ends_with_space
+                && words.len() >= 3
+                && matches!(words[words.len() - 2], "--kind" | "--indexer-kind")
+            {
                 Some(words[words.len() - 1])
             } else {
                 None
@@ -1161,17 +1167,37 @@ impl Completer for TbHelper {
             return Ok(r);
         }
 
-        if sub == "reindex" && words.len() == 2 && !ends_with_space {
-            let w = words[1];
-            let mut pairs = Vec::new();
-            if "/".starts_with(w) {
-                pairs.push(Pair {
-                    display: "/".into(),
-                    replacement: "/ ".into(),
-                });
+        if sub == "reindex" {
+            let slot = if ends_with_space {
+                words.len()
+            } else {
+                words.len() - 1
+            };
+            let candidates: &[&str] = match slot {
+                1 => &["job"],
+                2 if words.get(1) == Some(&"job") => {
+                    &["start", "explain", "list", "status", "stop"]
+                }
+                _ => &[],
+            };
+            if !candidates.is_empty() {
+                let prefix = if ends_with_space { "" } else { partial };
+                let pairs = candidates
+                    .iter()
+                    .filter(|s| s.starts_with(prefix))
+                    .map(|s| Pair {
+                        display: (*s).into(),
+                        replacement: format!("{s} "),
+                    })
+                    .collect();
+                return Ok((if ends_with_space { pos } else { start }, pairs));
             }
-            pairs.extend(self.complete_path(&mut state, w));
-            return Ok((start, pairs));
+            if slot == 3 && matches!(words.get(2), Some(&"start" | &"explain")) {
+                return Ok((
+                    if ends_with_space { pos } else { start },
+                    self.complete_path(&mut state, if ends_with_space { "" } else { partial }),
+                ));
+            }
         }
 
         // Flag completion
@@ -1283,8 +1309,7 @@ impl Helper for TbHelper {}
 fn word_start(line: &str, pos: usize) -> usize {
     line[..pos]
         .char_indices()
-        .filter(|(_, c)| c.is_whitespace())
-        .next_back()
+        .rfind(|(_, c)| c.is_whitespace())
         .map_or(0, |(i, c)| i + c.len_utf8())
 }
 
@@ -1590,10 +1615,25 @@ pub(crate) fn apply_shell_cwd(cmd: Command, shell_cwd: Option<&str>) -> Result<C
             path: resolve_shell_doc_path(&path, shell_cwd)?,
             time,
         },
-        Command::Reindex { path, kind } => Command::Reindex {
-            kind,
-            path: resolve_shell_tree_scope(&path, shell_cwd)?,
-        },
+        Command::Reindex {
+            command: crate::ReindexCommand::Job { command },
+        } => {
+            let command = match command {
+                crate::ReindexJobCommand::Start(mut options) => {
+                    options.path = resolve_shell_tree_scope(&options.path, shell_cwd)?;
+                    crate::ReindexJobCommand::Start(options)
+                }
+                crate::ReindexJobCommand::Explain(mut options) => {
+                    options.path = resolve_shell_tree_scope(&options.path, shell_cwd)?;
+                    crate::ReindexJobCommand::Explain(options)
+                }
+                other => other,
+            };
+            Command::Reindex {
+                command: crate::ReindexCommand::Job { command },
+            }
+        }
+
         Command::Whoami => Command::Whoami,
         Command::AclList => Command::AclList,
         Command::AclGet { name } => Command::AclGet { name },
@@ -1904,6 +1944,7 @@ fn build_editor(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // Explicit shell startup options.
 fn run_shell_blocking(
     client: Arc<Mutex<Client>>,
     handle: Handle,
@@ -1970,7 +2011,7 @@ fn run_shell_blocking(
                             push_history(&mut rl, &history_path, trimmed)?;
                         }
                         Err(e) => {
-                            print_cli_message(&e.to_string());
+                            print_cli_message(&e.clone());
                             push_history(&mut rl, &history_path, trimmed)?;
                         }
                     }
@@ -1983,7 +2024,7 @@ fn run_shell_blocking(
                             push_history(&mut rl, &history_path, trimmed)?;
                         }
                         Err(e) => {
-                            print_cli_message(&e.to_string());
+                            print_cli_message(&e.clone());
                             push_history(&mut rl, &history_path, trimmed)?;
                         }
                     }
@@ -2002,7 +2043,7 @@ fn run_shell_blocking(
                                 push_history(&mut rl, &history_path, trimmed)?;
                             }
                             Err(e) => {
-                                print_cli_message(&e.to_string());
+                                print_cli_message(&e.clone());
                                 push_history(&mut rl, &history_path, trimmed)?;
                             }
                         }
@@ -2048,7 +2089,7 @@ fn run_shell_blocking(
                     match apply_shell_cwd(parsed.command, g.cwd.as_deref()) {
                         Ok(c) => c,
                         Err(e) => {
-                            print_cli_message(&e.to_string());
+                            print_cli_message(&e.clone());
                             push_history(&mut rl, &history_path, trimmed)?;
                             continue;
                         }
@@ -2384,6 +2425,7 @@ mod shell_cwd_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
     fn path_first_commands_resolve() {
         for (cmd, expect) in [
             (
@@ -2509,31 +2551,24 @@ mod shell_cwd_tests {
     }
 
     #[test]
-    fn reindex_preserves_slash_sentinel_strips_directory_segment() {
-        let r = unwrap_ac(
-            Command::Reindex {
-                kind: Default::default(),
-                path: "/".into(),
-            },
-            Some("c"),
-        );
-        assert!(matches!(r, Command::Reindex { path, .. } if path == "/"));
-        let r2 = unwrap_ac(
-            Command::Reindex {
-                kind: Default::default(),
-                path: "/work".into(),
-            },
-            Some("c"),
-        );
-        assert!(matches!(r2, Command::Reindex { path, .. } if path == "work"));
-        let r_dot = unwrap_ac(
-            Command::Reindex {
-                kind: Default::default(),
-                path: ".".into(),
-            },
-            Some("c"),
-        );
-        assert!(matches!(r_dot, Command::Reindex { path, .. } if path == "c"));
+    fn reindex_job_scope_resolves() {
+        for (input, expected) in [("/", "/"), ("/work", "work"), (".", "c")] {
+            let command = Command::Reindex {
+                command: crate::ReindexCommand::Job {
+                    command: crate::ReindexJobCommand::Start(crate::ReindexSelection {
+                        path: input.into(),
+                        non_indexed_only: true,
+                        indexer_kind: tabularium::SearchKind::default(),
+                    }),
+                },
+            };
+            let result = unwrap_ac(command, Some("c"));
+            assert!(
+                matches!(result, Command::Reindex { command: crate::ReindexCommand::Job {
+                command: crate::ReindexJobCommand::Start(crate::ReindexSelection { path, .. })
+            }} if path == expected)
+            );
+        }
     }
 
     #[test]
@@ -2544,10 +2579,10 @@ mod shell_cwd_tests {
                 json: false,
                 limit: None,
                 max_output_bytes: None,
-                sort: Default::default(),
+                sort: tabularium::SearchSort::default(),
                 modified_after: None,
                 modified_before: None,
-                kind: Default::default(),
+                kind: tabularium::SearchKind::default(),
                 directory: None,
                 query: vec!["q".into()],
             },
@@ -2567,10 +2602,10 @@ mod shell_cwd_tests {
                 json: false,
                 limit: None,
                 max_output_bytes: None,
-                sort: Default::default(),
+                sort: tabularium::SearchSort::default(),
                 modified_after: None,
                 modified_before: None,
-                kind: Default::default(),
+                kind: tabularium::SearchKind::default(),
                 directory: Some("/notes".into()),
                 query: vec!["q".into()],
             },
@@ -2583,10 +2618,10 @@ mod shell_cwd_tests {
                 json: false,
                 limit: None,
                 max_output_bytes: None,
-                sort: Default::default(),
+                sort: tabularium::SearchSort::default(),
                 modified_after: None,
                 modified_before: None,
-                kind: Default::default(),
+                kind: tabularium::SearchKind::default(),
                 directory: Some("/".into()),
                 query: vec!["q".into()],
             },
@@ -2603,10 +2638,10 @@ mod shell_cwd_tests {
                 json: false,
                 limit: None,
                 max_output_bytes: None,
-                sort: Default::default(),
+                sort: tabularium::SearchSort::default(),
                 modified_after: None,
                 modified_before: None,
-                kind: Default::default(),
+                kind: tabularium::SearchKind::default(),
                 directory: Some(".".into()),
                 query: vec!["q".into()],
             },
@@ -2819,6 +2854,7 @@ mod shell_cwd_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
     fn path_first_commands_absolute_slash_strips_with_cwd() {
         for (cmd, expect) in [
             (
@@ -3263,12 +3299,18 @@ mod shell_initial_cwd_mkdir_parents_tests {
         .await
         .unwrap()
         .unwrap();
-        client
-            .lock()
-            .unwrap()
-            .list_directory("/shell_init_mkdir/a/b")
-            .await
-            .unwrap();
+        let handle = Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(
+                client
+                    .lock()
+                    .unwrap()
+                    .list_directory("/shell_init_mkdir/a/b"),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
         let g = state.lock().unwrap();
         assert_eq!(g.cwd.as_deref(), Some("shell_init_mkdir/a/b"));
     }

@@ -252,7 +252,7 @@ impl<S: Storage> Database<S> {
         fields(
             keywords_len = keywords.as_ref().len(),
             directory = ?directory_prefix,
-            restrict_document = ?restrict_to_document.map(|id| id.raw()),
+            restrict_document = ?restrict_to_document.map(super::EntryId::raw),
             limit,
         ),
         err(Debug)

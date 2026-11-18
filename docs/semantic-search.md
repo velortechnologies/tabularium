@@ -12,14 +12,14 @@ Without `[semantic]`, default hybrid remains lexical-only and works with old dat
 
 - `tabularium.db` remains authoritative; its schema is not changed by this feature.
 - `tabularium.index` remains the Tantivy directory.
-- A separate sibling `tabularium.semantic.index/semantic.db` stores derived vectors, exact byte/line coordinates, document revisions, model/preprocessing identity and persistent dirty IDs. It is disposable and reconstructible. Treat it as private data like the source database.
-- Initial upgrade: add optional `[semantic]` configuration, restart, run `tb reindex --kind semantic /` once. Plain `tb reindex` rebuilds both configured engines.
+- A separate sibling `tabularium.semantic.index/semantic.db` stores derived vectors, exact byte/line coordinates, document revisions, model/preprocessing identity. It is disposable and reconstructible. Treat it as private data like the source database.
+- Initial upgrade: add optional `[semantic]` configuration, restart, run `tb reindex job start / --indexer-kind semantic` once. Plain `tb reindex job start /` rebuilds both configured engines.
 - Model ID/revision, prefixes, normalization or chunk settings changing require a full semantic rebuild, not a migration. Pin the provider model version with `model_revision`; alias-only model changes on a remote server cannot be reliably detected when dimensions stay equal.
 - Moving the same inference model between CPU and GPU does not require a new client or database layout.
 
-Rebuilds are synchronous API operations and may take minutes; the typed client's reindex call allows up to one hour. CLI is preferred for long first rebuilds; MCP/HTTP callers must configure an adequate transport timeout. A successful rebuild atomically replaces the selected semantic scope only after all embedding batches succeeded. A model/config change or first initialization requires a full rebuild, not a scoped one. Lexical and semantic rebuilds are independent; a hybrid rebuild can finish lexical and then fail semantic, which is reported as an error.
+Reindex is a server-owned background job, independent of the API connection. Writes index inline and log indexing failures without failing a successful source write. See [reindex jobs](reindex-jobs.md) for job lifecycle, cancellation, state, configuration and recovery. Commits happen per document; partial progress is retained on failure.
 
-Document create/update/append/describe/rename/move/delete enqueue sidecar refresh without waiting for the model. Queues persist, coalesce by document ID with generation guards and retry after failures. Startup reconciles source IDs against the derived store after it has been initialized, recovering a crash between source commit and dirty-queue insertion. Missing/revision-mismatched source excerpts are never returned. Indexing does not touch document `accessed_at`.
+Document writes index inline; failures are logged and leave stale revisions for explicit or automatic missing-only jobs. No startup dirty-queue worker runs. Missing/revision-mismatched source excerpts are never returned. Indexing does not touch document accessed_at.
 
 ## Embeddings service
 
@@ -37,16 +37,16 @@ The first implementation uses exact cosine scans in the SQLite sidecar, appropri
 tb search --kind semantic 'restore after failure'
 tb search --kind lexical 'exact_identifier'
 tb search 'restore after failure' # hybrid
-tb reindex --kind semantic /
-tb reindex --kind lexical /manual
-tb reindex / # hybrid
+tb reindex job start / --indexer-kind semantic
+tb reindex job start /manual --indexer-kind lexical
+tb reindex job start / # hybrid
 ```
 
 REST:
 
 - `GET /api/search?q=...&kind=hybrid&dir=/manual`
 - `POST /api/search`: JSON/form/multipart fields `q`, optional `dir`, `kind`, `with_status`.
-- `POST /api/reindex`: JSON `{ "kind":"semantic", "path":"/" }`; same admin requirement as RPC reindex.
+- `POST /api/reindex`: JSON `{ "action":"start", "indexer_kind":"semantic", "path":"/" }`; same admin requirement as RPC reindex.
 
 REST search returns the existing hit array unless `with_status=true`. It always sets `X-Tabularium-Lexical-Status` and `X-Tabularium-Semantic-Status` response headers, including for empty results.
 
@@ -54,7 +54,7 @@ JSON-RPC:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"search","params":{"query":"restore after failure","kind":"hybrid","with_status":true}}
-{"jsonrpc":"2.0","id":2,"method":"reindex","params":{"kind":"semantic","path":"/"}}
+{"jsonrpc":"2.0","id":2,"method":"reindex_job_start","params":{"indexer_kind":"semantic","path":"/"}}
 ```
 
 RPC search preserves the legacy hit array by default. With `with_status=true`, it returns `{hits, lexical_status, semantic_status}`. MCP search uses this rich envelope by default. Existing hit fields remain; `line_end` and `revision` describe validated semantic excerpts. Ordinary snippets without source revision keep their legacy meaning.

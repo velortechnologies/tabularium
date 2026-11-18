@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 mod common;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn binary_http_rpc_range_copy_and_metadata() {
     let server = common::spawn_test_server().await;
     let c = reqwest::Client::new();
@@ -133,6 +134,7 @@ async fn binary_http_rpc_range_copy_and_metadata() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn cookie_sessions_acl_csrf_logout_and_revocation() {
     use std::{sync::Arc, time::Duration};
     let dir = tempfile::tempdir().unwrap();

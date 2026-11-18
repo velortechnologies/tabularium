@@ -175,7 +175,7 @@ fn print_wc_gnu_line(width: usize, values: &[String], label: &str) {
     }
 }
 
-fn print_wc_output(resp: &WcResponse, filter: WcMetricsFilter) -> Result<(), BoxErr> {
+fn print_wc_output(resp: &WcResponse, filter: WcMetricsFilter) {
     let tty = io::stdout().is_terminal();
     let multi = resp.is_batch();
 
@@ -209,28 +209,27 @@ fn print_wc_output(resp: &WcResponse, filter: WcMetricsFilter) -> Result<(), Box
             let mut hdr = vec!["path"];
             hdr.extend(headers);
             print_cli_table(true, &hdr, &table_rows);
-            return Ok(());
+            return;
         }
 
         for f in files {
             print_wc_gnu_line(width, &wc_metric_values(f.metrics(), filter), f.path());
         }
         print_wc_gnu_line(width, &wc_metric_values(&total, filter), "total");
-        return Ok(());
+        return;
     }
 
     let m = resp.single_metrics();
     let values = wc_metric_values(&m, filter);
     if tty && filter.active_columns() > 1 {
         print_cli_table(true, &filter.column_labels(), &[values]);
-        return Ok(());
+        return;
     }
     if filter.active_columns() == 1 {
-        println!("{}", values.first().map(String::as_str).unwrap_or("0"));
-        return Ok(());
+        println!("{}", values.first().map_or("0", String::as_str));
+        return;
     }
     print_wc_gnu_line(0, &values, "");
-    Ok(())
 }
 
 async fn resolve_read_file_paths(client: &Client, user_path: &str) -> Result<Vec<String>, BoxErr> {
@@ -333,12 +332,10 @@ fn rw_paths<'a>(branch: &'a Value, key: &str) -> &'a [Value] {
     branch
         .get(key)
         .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[], Vec::as_slice)
 }
 
 fn push_path_block(out: &mut String, heading: &str, paths: &[Value]) {
-    use std::fmt::Write as _;
     let _ = writeln!(out, "{heading}");
     if paths.is_empty() {
         let _ = writeln!(out, "  (none)");
@@ -356,12 +353,14 @@ fn push_path_block(out: &mut String, heading: &str, paths: &[Value]) {
 fn format_acl_human_readable(name: &str, body_json: &str) -> Result<String, BoxErr> {
     let acl: Value =
         serde_json::from_str(body_json).map_err(|e| -> BoxErr { e.to_string().into() })?;
-    let admin = acl.get("admin").and_then(|v| v.as_bool()).unwrap_or(false);
+    let admin = acl
+        .get("admin")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let allow = acl.get("allow").cloned().unwrap_or(json!({}));
     let deny = acl.get("deny").cloned().unwrap_or(json!({}));
 
     let mut out = String::new();
-    use std::fmt::Write as _;
     let _ = writeln!(out, "ACL: {name}");
     let _ = writeln!(out, "Administrator: {}", if admin { "yes" } else { "no" });
     let _ = writeln!(out);
@@ -404,7 +403,7 @@ fn psk_table_rows_from_json(v: &Value) -> Result<Vec<Vec<String>>, BoxErr> {
     Ok(rows)
 }
 
-fn print_psk_cli_table(rows: &[Vec<String>]) -> Result<(), BoxErr> {
+fn print_psk_cli_table(rows: &[Vec<String>]) {
     if io::stdout().is_terminal() {
         print_cli_table(true, &["acl", "name", "key"], rows);
     } else {
@@ -412,7 +411,6 @@ fn print_psk_cli_table(rows: &[Vec<String>]) -> Result<(), BoxErr> {
             println!("{}\t{}\t{}", r[0], r[1], r[2]);
         }
     }
-    Ok(())
 }
 
 pub(crate) fn execute_opts_from_command(cmd: &Command) -> ExecuteOpts {
@@ -1251,9 +1249,11 @@ pub(crate) async fn execute(
                     .get("body")
                     .and_then(|b| b.as_str())
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .and_then(|j| j.get("admin").and_then(|a| a.as_bool()))
-                    .map(|b| if b { "yes" } else { "no" }.to_string())
-                    .unwrap_or_else(|| "?".to_string());
+                    .and_then(|j| j.get("admin").and_then(serde_json::Value::as_bool))
+                    .map_or_else(
+                        || "?".to_string(),
+                        |b| if b { "yes" } else { "no" }.to_string(),
+                    );
                 rows.push(vec![name, admin_cell]);
             }
             rows.sort_by(|a, b| a[0].cmp(&b[0]));
@@ -1331,15 +1331,10 @@ pub(crate) async fn execute(
         Command::AclDestroy { name } => {
             client.acl_destroy(name.trim()).await?;
         }
-        Command::PskList => {
+        Command::PskList | Command::PskGet => {
             let v = client.psk_list().await?;
             let rows = psk_table_rows_from_json(&v)?;
-            print_psk_cli_table(&rows)?;
-        }
-        Command::PskGet => {
-            let v = client.psk_list().await?;
-            let rows = psk_table_rows_from_json(&v)?;
-            print_psk_cli_table(&rows)?;
+            print_psk_cli_table(&rows);
         }
         Command::PskCreate { name, acl_name } => {
             validate_entity_name(name.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
@@ -1365,7 +1360,7 @@ pub(crate) async fn execute(
         } => {
             let filter = WcMetricsFilter::from_cli_flags(lines, words, bytes, chars);
             let resp = client.wc(path.trim(), filter, recursive).await?;
-            print_wc_output(&resp, filter)?;
+            print_wc_output(&resp, filter);
         }
         Command::Meta {
             path,
@@ -1486,15 +1481,36 @@ pub(crate) async fn execute(
         } => {
             cmd_cp(client, &src, &dst, recursive).await?;
         }
-        Command::Reindex { path, kind } => {
-            let path =
-                normalize_user_path(path.trim()).map_err(|e| -> BoxErr { e.to_string().into() })?;
-            let rpc_path = if path == "/" {
-                None
-            } else {
-                Some(std::path::Path::new(path.as_str()))
+        Command::Reindex {
+            command: crate::ReindexCommand::Job { command },
+        } => {
+            use crate::ReindexJobCommand;
+            let explain = matches!(&command, ReindexJobCommand::Explain(_));
+            let (method, params) = match command {
+                ReindexJobCommand::Start(selection) | ReindexJobCommand::Explain(selection) => {
+                    let path = normalize_user_path(selection.path.trim())
+                        .map_err(|e| -> BoxErr { e.to_string().into() })?;
+                    (
+                        if explain {
+                            "reindex_job_explain"
+                        } else {
+                            "reindex_job_start"
+                        },
+                        serde_json::json!({"path":path,"non_indexed_only":selection.non_indexed_only,"indexer_kind":selection.indexer_kind}),
+                    )
+                }
+                ReindexJobCommand::List => ("reindex_job_list", serde_json::json!({})),
+                ReindexJobCommand::Status { id } => {
+                    ("reindex_job_status", serde_json::json!({"id":id}))
+                }
+                ReindexJobCommand::Stop { id } => {
+                    ("reindex_job_stop", serde_json::json!({"id":id}))
+                }
             };
-            client.reindex_with_kind(rpc_path, kind).await?;
+            let result = client
+                .reindex_job(method.trim_start_matches("reindex_job_"), params)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
     Ok(ExecuteOutcome::Ok)
@@ -2098,7 +2114,7 @@ async fn import_fs_subtree(
             match Ok::<String, std::io::Error>(String::new()) {
                 Ok(content) => {
                     match import_document_with_metadata(client, &tb_path, &content, &path).await {
-                        Ok(_) => {
+                        Ok(()) => {
                             println!("{label} - OK");
                             match fs_mtime_timestamp(&path) {
                                 Ok(ts) => {

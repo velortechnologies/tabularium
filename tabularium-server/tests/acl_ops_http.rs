@@ -277,7 +277,7 @@ async fn acl_ops_deny_override_search_scoped_tree_excludes_denied_file_rpc() {
         .filter_map(|h| h["path"].as_str())
         .collect();
     assert!(paths.contains(&"/test/file.txt"));
-    assert!(!paths.iter().any(|p| *p == "/test/secret.txt"));
+    assert!(!paths.contains(&"/test/secret.txt"));
 }
 
 #[tokio::test]
@@ -315,7 +315,7 @@ async fn acl_ops_deny_override_search_scoped_tree_excludes_denied_file_rest() {
         .filter_map(|h| h["path"].as_str())
         .collect();
     assert!(paths.contains(&"/test/file.txt"));
-    assert!(!paths.iter().any(|p| *p == "/test/secret.txt"));
+    assert!(!paths.contains(&"/test/secret.txt"));
 }
 
 #[tokio::test]
@@ -374,7 +374,10 @@ async fn acl_ops_rest_list_other_empty_for_subtree_psk() {
         .unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::OK);
     let rows = r.json::<Value>().await.unwrap();
-    assert!(rows.as_array().unwrap().is_empty());
+    assert_eq!(
+        rows.as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]
@@ -437,8 +440,8 @@ async fn acl_ops_search_subtree_filters_hits() {
         .iter()
         .filter_map(|h| h["path"].as_str())
         .collect();
-    assert!(paths.iter().any(|p| *p == "/test/file.txt"));
-    assert!(!paths.iter().any(|p| *p == "/other/file.txt"));
+    assert!(paths.contains(&"/test/file.txt"));
+    assert!(!paths.contains(&"/other/file.txt"));
 
     let v = rpc_json(
         &c,
@@ -455,7 +458,7 @@ async fn acl_ops_search_subtree_filters_hits() {
         .iter()
         .filter_map(|h| h["path"].as_str())
         .collect();
-    assert!(!paths.iter().any(|p| *p == "/other/file.txt"));
+    assert!(!paths.contains(&"/other/file.txt"));
 
     let v = rpc_json(
         &c,
@@ -466,7 +469,10 @@ async fn acl_ops_search_subtree_filters_hits() {
     )
     .await;
     assert_rpc_ok(&v, "search nomatch");
-    assert!(v["result"].as_array().unwrap().is_empty());
+    assert_eq!(
+        v["result"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]

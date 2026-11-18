@@ -589,7 +589,11 @@ fn row_to_file_meta(row: &SqliteRow, canonical_path: String) -> Result<DocumentM
         row.try_get::<i64, _>(7)?,
     )
     .with_mime_type(row.try_get::<Option<String>, _>(8)?)
-    .with_binary_metadata(row.try_get::<i64, _>(9)? as u8, row.try_get(10)?))
+    .with_binary_metadata(
+        u8::try_from(row.try_get::<i64, _>(9)?)
+            .map_err(|_| Error::InvalidInput("invalid binary metadata version".into()))?,
+        row.try_get(10)?,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1600,7 +1604,6 @@ impl Storage for SqliteStorage {
 mod tests {
     #[tokio::test]
     async fn binary_lifecycle_replace_move_metadata_and_delete() {
-        use crate::db::Storage;
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
         let storage = super::SqliteStorage::connect(format!(
@@ -1665,7 +1668,6 @@ mod tests {
 
     #[tokio::test]
     async fn binary_text_operations_fail_without_changing_revision_or_size() {
-        use crate::db::Storage;
         let dir = tempfile::tempdir().unwrap();
         let storage = super::SqliteStorage::connect(format!(
             "sqlite://{}",
@@ -1705,7 +1707,6 @@ mod tests {
 
     #[tokio::test]
     async fn binary_upgrade_preserves_legacy_rows_and_is_repeatable() {
-        use crate::db::Storage;
         let dir = tempfile::tempdir().unwrap();
         let uri = format!(
             "sqlite://{}",
@@ -1753,10 +1754,10 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_upgrade_preserves_legacy_rows_and_is_repeatable() {
+        use crate::db::Storage;
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("sqlite://{}", dir.path().join("legacy.db").display());
         let storage = super::SqliteStorage::connect(&uri).await.unwrap();
-        use crate::db::Storage;
         let id = storage
             .create_file("/legacy.md", "untouched body")
             .await

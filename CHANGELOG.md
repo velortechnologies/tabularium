@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-18
+
+### Changed
+
+- Replace blocking reindex with volatile parallel jobs: start, explain, list, status and stop.
+- Index document and metadata writes inline; track lexical and semantic revisions independently.
+- Add missing-only reindex, optional auto_reindex and dedicated llm_timeout.
+- Coordinate jobs and writes with RAII permits and cooperative index locking.
+- Log indexing failures without rejecting persisted writes; stop jobs on engine/model failures.
+- Add outage/recovery, cancellation, timeout and scheduling regression coverage.
+- Resolve workspace Clippy warnings and use checked index offset conversions.
+
 ## 0.1.9 - 2026-10-27
 
 ### Security

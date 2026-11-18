@@ -17,6 +17,31 @@ use tabularium::{
     HeaderMap, SearchKind, TailMode, merge_header_line, merge_into, parse_tb_headers_env,
 };
 
+#[derive(Debug, Clone, Subcommand)]
+enum ReindexCommand {
+    Job {
+        #[command(subcommand)]
+        command: ReindexJobCommand,
+    },
+}
+#[derive(Debug, Clone, Subcommand)]
+enum ReindexJobCommand {
+    Start(ReindexSelection),
+    Explain(ReindexSelection),
+    List,
+    Status { id: String },
+    Stop { id: String },
+}
+#[derive(Debug, Clone, clap::Args)]
+struct ReindexSelection {
+    #[arg(default_value = "/")]
+    path: String,
+    #[arg(long = "non-indexed-only", alias = "non_indexed_only")]
+    non_indexed_only: bool,
+    #[arg(long = "indexer-kind", alias = "kind", default_value = "hybrid", value_parser = parse_search_kind)]
+    indexer_kind: SearchKind,
+}
+
 fn parse_cli_tail_mode(s: &str) -> Result<TailMode, clap::Error> {
     TailMode::parse_cli_token(s).map_err(|msg| clap::Error::raw(ErrorKind::ValueValidation, msg))
 }
@@ -293,14 +318,10 @@ pub(crate) enum Command {
         #[arg(short = 'f', long)]
         force: bool,
     },
-    /// Rebuild search indexes: lexical (Tantivy), semantic, or hybrid (both, default).
+    /// Manage server-owned background index jobs.
     Reindex {
-        /// Search engine(s): lexical, semantic, hybrid.
-        #[arg(long,default_value="hybrid",value_parser=parse_search_kind)]
-        kind: SearchKind,
-        /// `/` or directory path.
-        #[arg(default_value = "/")]
-        path: String,
+        #[command(subcommand)]
+        command: ReindexCommand,
     },
     /// Remove file(s) (`DIR/FILE` or `DIR/GLOB`) or director(ies) (`DIR` or glob); `-r` only for directory paths.
     Rm {
@@ -461,9 +482,9 @@ mod cli_parse_tests {
                 ..
             }
         ));
-        let cli = Cli::try_parse_from(["tb", "reindex"]).unwrap();
+        let cli = Cli::try_parse_from(["tb", "reindex", "job", "start"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Reindex { kind: SearchKind::Hybrid, ref path } if path == "/")
+            matches!(cli.command, Command::Reindex { command: ReindexCommand::Job { command: ReindexJobCommand::Start(ReindexSelection { indexer_kind: SearchKind::Hybrid, ref path, .. }) } } if path == "/")
         );
         assert!(Cli::try_parse_from(["tb", "search", "--kind", "bogus", "query"]).is_err());
     }

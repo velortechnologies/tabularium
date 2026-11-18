@@ -58,7 +58,7 @@ Path segments under `/api/doc/…` accept **name** or **numeric id** per segment
 
 By default the response remains a JSON hit array. `with_status=true` returns `{ hits, lexical_status, semantic_status }`. Hits also expose optional `line_end` and `revision` for semantic excerpts. Both formats carry `X-Tabularium-Lexical-Status` and `X-Tabularium-Semantic-Status` response headers.
 
-`POST /api/reindex` accepts JSON `{ "path": "/", "kind": "semantic" }`; admin permission is required when API authentication is enabled.
+`POST /api/reindex` accepts JSON `{ "action": "start", "path": "/", "indexer_kind": "semantic" }`; admin permission is required when API authentication is enabled.
 
 Errors: JSON `{ "error": "message" }` with `400`, `401`, `403`, `404`, `409`,
 or `500` as appropriate.
@@ -66,7 +66,7 @@ or `500` as appropriate.
 
 ## Semantic and hybrid search
 
-Search and reindex accept `kind`: `lexical`, `semantic`, or `hybrid` (default).
+Search accepts `kind`; reindex jobs accept `indexer_kind`: `lexical`, `semantic`, or `hybrid` (default).
 Optional `[semantic]` config enables OpenAI-compatible embeddings, including custom HTTP headers.
 The semantic sidecar is rebuilt without migrating the document database.
 See [semantic search](semantic-search.md) for configuration, API status envelopes, upgrade steps, and fallback behavior.
@@ -131,3 +131,5 @@ cookie. Server sessions do not expire; logout or key/ACL removal revokes them.
 `POST /api/session/logout` revokes the current cookie session. Cookie-authenticated
 mutations require a same-origin Origin header. API key authentication remains
 available. Media URLs do not carry keys.
+
+See [reindex job lifecycle and configuration](reindex-jobs.md).

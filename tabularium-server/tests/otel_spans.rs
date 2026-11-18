@@ -190,7 +190,7 @@ async fn mcp_tool_error_marks_span_error() {
         .invoke_rpc_for_test("get_document", json!({ "path": "/does/not/exist.md" }))
         .await
         .expect_err("missing doc must fail");
-    assert!(!err.is_empty());
+    assert_ne!(err, "");
 
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();

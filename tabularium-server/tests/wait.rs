@@ -126,7 +126,7 @@ async fn rpc_wait_returns_null_on_change() {
         .unwrap();
 
     let h = tokio::spawn({
-        let base = base.to_string();
+        let base = base.clone();
         let path = path.clone();
         async move {
             let c = Client::builder()

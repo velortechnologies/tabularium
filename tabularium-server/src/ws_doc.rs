@@ -71,9 +71,7 @@ pub async fn ws_upgrade(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let auth: RequestAuth = if !st.authenticate_api {
-        RequestAuth::Disabled
-    } else {
+    let auth: RequestAuth = if st.authenticate_api {
         match resolve_request_auth_arc(
             st.db.as_ref(),
             true,
@@ -88,6 +86,8 @@ pub async fn ws_upgrade(
                 return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
             }
         }
+    } else {
+        RequestAuth::Disabled
     };
     ws.on_upgrade(move |socket| handle_socket(socket, st.db.clone(), auth))
 }
@@ -108,6 +108,7 @@ async fn send_err(socket: &mut WebSocket, msg: impl Into<String>) -> bool {
     send_json(socket, &json!({ "op": "error", "message": msg.into() })).await
 }
 
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn handle_client_text(
     db: &SqliteDatabase,
     auth: &RequestAuth,

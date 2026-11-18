@@ -217,9 +217,7 @@ async fn api_whoami(State(st): State<AppState>, headers: HeaderMap) -> ApiResult
 }
 
 async fn api_resolve_auth(st: &AppState, headers: &HeaderMap) -> Result<RequestAuth, ApiError> {
-    Ok(if !st.authenticate_api {
-        RequestAuth::Disabled
-    } else {
+    Ok(if st.authenticate_api {
         resolve_request_auth_arc(
             st.db.as_ref(),
             true,
@@ -229,6 +227,8 @@ async fn api_resolve_auth(st: &AppState, headers: &HeaderMap) -> Result<RequestA
         )
         .await
         .map_err(ApiError)?
+    } else {
+        RequestAuth::Disabled
     })
 }
 
@@ -921,10 +921,15 @@ async fn search_inner(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReindexBody {
+    action: String,
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
-    kind: SearchKind,
+    non_indexed_only: bool,
+    #[serde(default)]
+    indexer_kind: SearchKind,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 async fn rest_reindex(
@@ -934,14 +939,33 @@ async fn rest_reindex(
 ) -> ApiResult<Json<Value>> {
     let auth = api_resolve_auth(&st, &headers).await?;
     require_mgmt_admin(&auth)?;
-    let path = b
-        .path
-        .as_deref()
-        .filter(|p| !p.is_empty() && *p != "/")
-        .map(normalize_path_for_rpc)
-        .transpose()?;
-    st.db.reindex_kind(path.as_deref(), b.kind).await?;
-    Ok(Json(Value::Null))
+    let result = match b.action.as_str() {
+        "start" | "explain" => {
+            let options = tabularium::ReindexOptions {
+                path: normalize_path_for_rpc(b.path.as_deref().unwrap_or("/"))?,
+                non_indexed_only: b.non_indexed_only,
+                indexer_kind: b.indexer_kind,
+            };
+            if b.action == "start" {
+                json!({"id": st.db.reindex_job_start(options).await?})
+            } else {
+                json!(st.db.reindex_explain(&options).await?)
+            }
+        }
+        "list" => json!(st.db.reindex_jobs()),
+        "status" | "stop" => {
+            let id =
+                b.id.ok_or_else(|| Error::InvalidInput("job id required".into()))?;
+            if b.action == "status" {
+                json!(st.db.reindex_job_status(&id)?)
+            } else {
+                st.db.reindex_job_stop(&id).await?;
+                Value::Null
+            }
+        }
+        _ => return Err(Error::InvalidInput("unknown reindex job action".into()).into()),
+    };
+    Ok(Json(result))
 }
 
 fn rpc_search_kind(m: &Map<String, Value>) -> tabularium::Result<SearchKind> {
@@ -1404,7 +1428,7 @@ pub(crate) async fn dispatch_app_rpc(
                 "rename_snapshot" => {
                     st.db
                         .rename_snapshot(&path, name, get_str(&m, "new_name")?, recursive)
-                        .await?
+                        .await?;
                 }
                 _ => unreachable!(),
             }
@@ -1519,11 +1543,8 @@ pub(crate) async fn dispatch_app_rpc(
                 })?),
             };
             st.db.touch_document_by_path(&path, modified_at).await?;
-            let meta = match st.db.document_ref_by_path(&path).await {
-                Ok(m) => m,
-                Err(_) => {
-                    return Ok(json!({ "revision": Value::Null }));
-                }
+            let Ok(meta) = st.db.document_ref_by_path(&path).await else {
+                return Ok(json!({ "revision": Value::Null }));
             };
             info!(
                 target: "tabularium_server::api",
@@ -1709,9 +1730,7 @@ pub(crate) async fn dispatch_app_rpc(
         "exists" => {
             let path = rpc_path(&m, "path")?;
             let ex = st.db.document_exists_at_path(&path).await?;
-            if ex {
-                check_read(auth, &path).map_err(RpcAppError::Other)?;
-            } else if directory_listing_requires_parent_readable(auth, &path) {
+            if ex || directory_listing_requires_parent_readable(auth, &path) {
                 check_read(auth, &path).map_err(RpcAppError::Other)?;
             }
             Ok(json!(ex))
@@ -1758,28 +1777,40 @@ pub(crate) async fn dispatch_app_rpc(
                 .await?;
             Ok(search_wire(&report, with_status, budget).0)
         }
-        "reindex" => {
+        "reindex_job_start" | "reindex_job_explain" => {
             require_mgmt_admin(auth).map_err(RpcAppError::Other)?;
-            let filter: Option<String> = match m.get("path") {
-                None | Some(Value::Null) => None,
-                Some(v) if v.is_null() => None,
-                Some(v) => {
-                    let s = v
-                        .as_str()
-                        .ok_or_else(|| Error::InvalidInput("path must be string or null".into()))?;
-                    if s.is_empty() || s == "/" {
-                        None
-                    } else {
-                        let n = normalize_path_for_rpc(s)?;
-                        canonical_path_segments(&n)?;
-                        Some(n)
-                    }
-                }
-            };
-            st.db
-                .reindex_kind(filter.as_deref(), rpc_search_kind(&m)?)
-                .await?;
-            Ok(Value::Null)
+            let mut options: tabularium::ReindexOptions =
+                serde_json::from_value(Value::Object(m.clone()))
+                    .map_err(|e| Error::InvalidInput(e.to_string()))?;
+            options.path = normalize_path_for_rpc(&options.path)?;
+            if method == "reindex_job_start" {
+                Ok(json!({"id": st.db.reindex_job_start(options).await?}))
+            } else {
+                Ok(json!(st.db.reindex_explain(&options).await?))
+            }
+        }
+        "reindex_job_list" => {
+            require_mgmt_admin(auth).map_err(RpcAppError::Other)?;
+            Ok(json!(st.db.reindex_jobs()))
+        }
+        "reindex_job_status" | "reindex_job_stop" => {
+            require_mgmt_admin(auth).map_err(RpcAppError::Other)?;
+            let id = m
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::InvalidInput("id must be a job UUID".into()))?;
+            if method == "reindex_job_status" {
+                Ok(json!(st.db.reindex_job_status(id)?))
+            } else {
+                st.db.reindex_job_stop(id).await?;
+                Ok(Value::Null)
+            }
+        }
+        "index_state" => {
+            let path = rpc_path(&m, "path")?;
+            check_read(auth, &path).map_err(RpcAppError::Other)?;
+            let id = st.db.resolve_existing_file_path(&path).await?;
+            Ok(json!(st.db.document_index_state(id).await?))
         }
         "head" => {
             let path = rpc_path(&m, "path")?;
@@ -2022,30 +2053,7 @@ pub(crate) async fn dispatch_app_rpc(
     }
 }
 
-#[cfg(test)]
-mod access_psk_gen_tests {
-    use super::generate_access_psk;
-
-    #[test]
-    fn psk_is_44_chars_from_mixed_alnum_alphabet() {
-        const OK: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let mut saw_upper = false;
-        let mut saw_lower = false;
-        let mut saw_digit = false;
-        for _ in 0..48 {
-            let s = generate_access_psk();
-            assert_eq!(s.len(), 44, "{s:?}");
-            for b in s.bytes() {
-                assert!(OK.contains(&b), "char {:?} not in alphabet", b as char);
-                saw_upper |= b.is_ascii_uppercase();
-                saw_lower |= b.is_ascii_lowercase();
-                saw_digit |= b.is_ascii_digit();
-            }
-        }
-        assert!(saw_upper && saw_lower && saw_digit);
-    }
-}
-
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn rest_put_content(
     State(st): State<AppState>,
     Path(rest): Path<String>,
@@ -2061,16 +2069,19 @@ async fn rest_put_content(
     let supplied = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let mime = supplied.map(str::to_owned).unwrap_or_else(|| {
-        mime_guess::from_path(&path)
-            .first_raw()
-            .unwrap_or(if std::path::Path::new(&path).extension().is_some() {
-                "application/octet-stream"
-            } else {
-                "text/markdown"
-            })
-            .to_owned()
-    });
+    let mime = supplied.map_or_else(
+        || {
+            mime_guess::from_path(&path)
+                .first_raw()
+                .unwrap_or(if std::path::Path::new(&path).extension().is_some() {
+                    "application/octet-stream"
+                } else {
+                    "text/markdown"
+                })
+                .to_owned()
+        },
+        str::to_owned,
+    );
     let expected = headers
         .get(header::IF_MATCH)
         .map(|v| {
@@ -2124,7 +2135,7 @@ async fn rest_put_content(
             Ok(meta) => {
                 st.db
                     .replace_binary_with_text(meta.id(), &text, &mime, expected.as_deref())
-                    .await?
+                    .await?;
             }
             Err(Error::NotFound(_)) => {
                 st.db
@@ -2155,6 +2166,7 @@ async fn rest_put_content(
     Ok(Json(json!({"path":path,"revision":meta.revision(),"content_kind":meta.content_kind(),"size_bytes":meta.size_bytes(),"sha256":meta.sha256()})).into_response())
 }
 
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn rest_get_content(
     State(st): State<AppState>,
     Path(rest): Path<String>,
@@ -2186,41 +2198,40 @@ async fn rest_get_content(
     if headers
         .get(header::IF_RANGE)
         .is_none_or(|v| v.as_bytes() == etag.as_bytes())
+        && let Some(range) = headers.get(header::RANGE)
     {
-        if let Some(range) = headers.get(header::RANGE) {
-            let parsed = range
-                .to_str()
-                .ok()
-                .and_then(|v| v.strip_prefix("bytes="))
-                .and_then(|v| v.split_once('-'))
-                .and_then(|(a, b)| {
-                    if a.is_empty() {
-                        let suffix = b.parse::<u64>().ok()?;
-                        if suffix == 0 || size == 0 {
-                            return None;
-                        }
-                        Some((size.saturating_sub(suffix), size - 1))
-                    } else {
-                        let first = a.parse::<u64>().ok()?;
-                        let last = if b.is_empty() {
-                            size.checked_sub(1)?
-                        } else {
-                            b.parse::<u64>().ok()?.min(size.checked_sub(1)?)
-                        };
-                        (first <= last && first < size).then_some((first, last))
+        let parsed = range
+            .to_str()
+            .ok()
+            .and_then(|v| v.strip_prefix("bytes="))
+            .and_then(|v| v.split_once('-'))
+            .and_then(|(a, b)| {
+                if a.is_empty() {
+                    let suffix = b.parse::<u64>().ok()?;
+                    if suffix == 0 || size == 0 {
+                        return None;
                     }
-                });
-            let Some((first, last)) = parsed else {
-                return Ok((
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    [(header::CONTENT_RANGE, format!("bytes */{size}"))],
-                )
-                    .into_response());
-            };
-            start = first;
-            count = last - first + 1;
-            status = StatusCode::PARTIAL_CONTENT;
-        }
+                    Some((size.saturating_sub(suffix), size - 1))
+                } else {
+                    let first = a.parse::<u64>().ok()?;
+                    let last = if b.is_empty() {
+                        size.checked_sub(1)?
+                    } else {
+                        b.parse::<u64>().ok()?.min(size.checked_sub(1)?)
+                    };
+                    (first <= last && first < size).then_some((first, last))
+                }
+            });
+        let Some((first, last)) = parsed else {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response());
+        };
+        start = first;
+        count = last - first + 1;
+        status = StatusCode::PARTIAL_CONTENT;
     }
     let mut file = tokio::fs::File::from_std(file);
     file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -2317,12 +2328,11 @@ async fn browser_session_middleware(
     };
     let logout = request.uri().path() == "/api/session/logout";
     let mut response = next.run(request).await;
-    if !logout {
-        if let Some(token) = renew {
-            if let Ok(value) = HeaderValue::from_str(&browser_cookie(&token, secure)) {
-                response.headers_mut().append(header::SET_COOKIE, value);
-            }
-        }
+    if !logout
+        && let Some(token) = renew
+        && let Ok(value) = HeaderValue::from_str(&browser_cookie(&token, secure))
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
 }
@@ -2352,4 +2362,28 @@ async fn browser_logout(State(st): State<AppState>, headers: HeaderMap) -> ApiRe
         Json(json!({"ok":true})),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod access_psk_gen_tests {
+    use super::generate_access_psk;
+
+    #[test]
+    fn psk_is_44_chars_from_mixed_alnum_alphabet() {
+        const OK: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut saw_upper = false;
+        let mut saw_lower = false;
+        let mut saw_digit = false;
+        for _ in 0..48 {
+            let s = generate_access_psk();
+            assert_eq!(s.len(), 44, "{s:?}");
+            for b in s.bytes() {
+                assert!(OK.contains(&b), "char {:?} not in alphabet", b as char);
+                saw_upper |= b.is_ascii_uppercase();
+                saw_lower |= b.is_ascii_lowercase();
+                saw_digit |= b.is_ascii_digit();
+            }
+        }
+        assert!(saw_upper && saw_lower && saw_digit);
+    }
 }

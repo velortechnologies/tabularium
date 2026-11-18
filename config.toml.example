@@ -1,3 +1,6 @@
+# Optional root missing-only indexing interval in seconds (omit to disable; zero invalid).
+# auto_reindex = 900
+
 [server]
 listen = "127.0.0.1:3050"
 # For systemd (see systemd/tabularium-server.service), install as e.g. /etc/tabularium/config.toml
@@ -48,14 +51,14 @@ authenticate = false
 
 # Optional semantic search. Omit this section for lexical-only operation.
 # Existing document databases need no migration. After enabling, run:
-#   tb reindex --kind semantic /
+#   tb reindex job start / --indexer-kind semantic
 # The default search/reindex kind is hybrid; lexical means Tantivy only.
 # [semantic]
 # base_url = "http://127.0.0.1:8011/v1"
 # model = "bge-m3"
 # model_revision = "pin-provider-model-version-here"
 # index_dir = "./data/tabularium.semantic.index" # default: sibling of server.index_dir
-# timeout = 30         # per embedding batch, seconds
+# llm_timeout = 30     # per embedding batch, seconds (legacy alias: timeout)
 # search_timeout = 2   # semantic branch deadline, seconds
 # chunk_bytes = 768    # UTF-8 byte window, NOT a model token count
 # overlap_bytes = 96

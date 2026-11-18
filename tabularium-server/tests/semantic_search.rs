@@ -37,6 +37,7 @@ async fn embed(
     Json(json!({"data":data})).into_response()
 }
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn semantic_transports_reindex_status_and_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let offline = Arc::new(AtomicBool::new(false));
@@ -68,7 +69,7 @@ async fn semantic_transports_reindex_status_and_fallback() {
         .await
         .unwrap();
     let app = router(AppState {
-        db,
+        db: db.clone(),
         wait_timeout: Duration::from_secs(1),
         process_started_at: Monotonic::now(),
         authenticate_api: false,
@@ -84,11 +85,20 @@ async fn semantic_transports_reindex_status_and_fallback() {
     let client = reqwest::Client::new();
     let r = client
         .post(format!("{base}/api/reindex"))
-        .json(&json!({"kind":"hybrid"}))
+        .json(&json!({"action":"start","path":"/","indexer_kind":"hybrid"}))
         .send()
         .await
         .unwrap();
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let started: Value = r.json().await.unwrap();
+    assert!(started["id"].is_string());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !db.reindex_jobs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let bodies = [
         client
             .get(format!(

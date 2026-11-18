@@ -43,7 +43,13 @@ const MCP_HELP_BASE: &str = include_str!("../res/mcp/help.txt");
 const TOOL_NAMES_LINE: &str = "Call tool `methods` for the live catalog; the registered set depends on config `mcp.full` (reindex, ACL/PSK admin tools, and `whoami` are omitted unless full mode is enabled).";
 
 /// JSON-RPC / MCP tool names stripped when `mcp.full` is false. Each name must match a `#[tool]` on [`TabulariumMcp`].
-const MCP_FULL_ONLY_TOOL_NAMES: &[&str] = &["reindex"];
+const MCP_FULL_ONLY_TOOL_NAMES: &[&str] = &[
+    "reindex_job_start",
+    "reindex_job_explain",
+    "reindex_job_list",
+    "reindex_job_status",
+    "reindex_job_stop",
+];
 
 /// Identity / ACL / PSK MCP tools — gated by `mcp.full`.
 const MCP_FULL_ONLY_ACL_PSK_TOOL_NAMES: &[&str] = &[
@@ -57,7 +63,7 @@ const MCP_FULL_ONLY_ACL_PSK_TOOL_NAMES: &[&str] = &[
     "psk_destroy",
 ];
 
-const MCP_METHODS_CATALOG_FULL: &str = r#"
+const MCP_METHODS_CATALOG_FULL: &str = r"
 
 **mcp.full = true only (trusted / private deployments):**
 
@@ -70,8 +76,9 @@ psk_list — (no params).
 psk_create — name (PSK handle), acl_name (string). Response includes the raw key string — use it as **`X-Auth-Key`** for authenticated MCP/RPC calls.
 psk_destroy — name (PSK handle).
 
-reindex — kind optional: lexical|semantic|hybrid (default hybrid); path optional (omit or `/` for full rebuild; subtree otherwise). Semantic requires configured embeddings and the first rebuild must be full.
-"#;
+reindex_job_start / reindex_job_explain — path (default /), non_indexed_only (false), indexer_kind (lexical|semantic|hybrid; default hybrid). start returns UUID; explain lists selected documents.
+reindex_job_list — active jobs only. reindex_job_status / reindex_job_stop — id (UUID). Finished jobs are removed and logged.
+";
 
 const MCP_METHODS_CATALOG: &str = r#"MCP tools (parameters mirror POST /rpc JSON objects).
 
@@ -221,9 +228,7 @@ impl TabulariumMcp {
         async {
             let _active = enter_active_tool(method);
             let started = Instant::now();
-            let auth: RequestAuth = if !self.app.authenticate_mcp {
-                RequestAuth::Disabled
-            } else if method == "test" {
+            let auth: RequestAuth = if !self.app.authenticate_mcp || method == "test" {
                 RequestAuth::Disabled
             } else {
                 match resolve_request_auth_arc(
@@ -257,16 +262,13 @@ impl TabulariumMcp {
                     RpcAppError::Other(err) => err.to_string(),
                 }),
             };
-            match &result {
-                Ok(_) => {
-                    tracing::Span::current().record("otel.status_code", "OK");
-                    record_tool_call(method, started, true);
-                }
-                Err(_) => {
-                    tracing::Span::current().record("otel.status_code", "ERROR");
-                    tracing::Span::current().record("error.type", "tool_error");
-                    record_tool_call(method, started, false);
-                }
+            if result.is_ok() {
+                tracing::Span::current().record("otel.status_code", "OK");
+                record_tool_call(method, started, true);
+            } else {
+                tracing::Span::current().record("otel.status_code", "ERROR");
+                tracing::Span::current().record("error.type", "tool_error");
+                record_tool_call(method, started, false);
             }
             result
         }
@@ -526,7 +528,14 @@ struct ReindexArg {
     path: Option<String>,
     /// Engine selection; defaults to hybrid.
     #[serde(default)]
-    kind: Option<KindArg>,
+    indexer_kind: Option<KindArg>,
+    #[serde(default)]
+    non_indexed_only: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct JobIdArg {
+    id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -906,10 +915,7 @@ Examples:
         let mut m = Map::new();
         m.insert("path".into(), json!(p.path));
         if let Some(l) = p.lines {
-            m.insert(
-                "lines".into(),
-                json!(l.parse_u32().map_err(|e| e.to_string())?),
-            );
+            m.insert("lines".into(), json!(l.parse_u32().map_err(|e| e.clone())?));
         }
         self.call_rpc_json(&parts, "head", Value::Object(m)).await
     }
@@ -926,7 +932,7 @@ Examples:
         m.insert("path".into(), json!(p.path));
         m.insert(
             "lines".into(),
-            tail_lines_to_rpc_value(p.lines.as_ref()).map_err(|e| e.to_string())?,
+            tail_lines_to_rpc_value(p.lines.as_ref()).map_err(|e| e.clone())?,
         );
         self.call_rpc_json(&parts, "tail", Value::Object(m)).await
     }
@@ -939,8 +945,8 @@ Examples:
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<SliceArg>,
     ) -> Result<String, String> {
-        let start = p.start_line.parse_u32().map_err(|e| e.to_string())?;
-        let end = p.end_line.parse_u32().map_err(|e| e.to_string())?;
+        let start = p.start_line.parse_u32().map_err(|e| e.clone())?;
+        let end = p.end_line.parse_u32().map_err(|e| e.clone())?;
         self.call_rpc_json(
             &parts,
             "slice",
@@ -1240,26 +1246,48 @@ Examples:
         .await
     }
 
-    #[tool(
-        description = "Rebuild selected search indexes (kind=lexical|semantic|hybrid, default hybrid); optional path limits subtree."
-    )]
-    async fn reindex(
+    #[tool(description = "Start a server-owned reindex job; returns its UUID immediately.")]
+    async fn reindex_job_start(
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<ReindexArg>,
     ) -> Result<String, String> {
-        let mut m = Map::new();
-        if let Some(kind) = p.kind {
-            m.insert("kind".into(), json!(kind.as_str()));
-        }
-        if let Some(path) = p.path.filter(|s| !s.is_empty()) {
-            m.insert("path".into(), json!(path));
-        }
-        self.call_rpc_json(&parts, "reindex", Value::Object(m))
+        self.call_rpc_json(&parts, "reindex_job_start", json!({"path":p.path.unwrap_or_else(|| "/".into()), "indexer_kind":p.indexer_kind.map_or("hybrid", |k| k.as_str()),"non_indexed_only":p.non_indexed_only})).await
+    }
+    #[tool(description = "List documents a reindex job would index, without starting it.")]
+    async fn reindex_job_explain(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<ReindexArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(&parts, "reindex_job_explain", json!({"path":p.path.unwrap_or_else(|| "/".into()), "indexer_kind":p.indexer_kind.map_or("hybrid", |k| k.as_str()),"non_indexed_only":p.non_indexed_only})).await
+    }
+    #[tool(description = "List active reindex jobs; completed jobs are not retained.")]
+    async fn reindex_job_list(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
+        self.call_rpc_json(&parts, "reindex_job_list", json!({}))
+            .await
+    }
+    #[tool(description = "Inspect active reindex job progress.")]
+    async fn reindex_job_status(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<JobIdArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(&parts, "reindex_job_status", json!({"id":p.id}))
+            .await
+    }
+    #[tool(description = "Stop and remove a reindex job; waits for in-flight indexing to settle.")]
+    async fn reindex_job_stop(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<JobIdArg>,
+    ) -> Result<String, String> {
+        self.call_rpc_json(&parts, "reindex_job_stop", json!({"id":p.id}))
             .await
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)] // Async methods are generated by the MCP trait macro.
 #[tool_handler]
 impl ServerHandler for TabulariumMcp {
     fn get_info(&self) -> ServerConfig {
@@ -1467,7 +1495,10 @@ mod search_option_tests {
             .await
             .unwrap();
         let report: Value = serde_json::from_str(&result).unwrap();
-        assert!(report["hits"].as_array().unwrap().is_empty());
+        assert_eq!(
+            report["hits"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(report["has_more"], false);
         assert!(
             mcp.search(

@@ -216,7 +216,7 @@ mod tests {
     fn header_line_has_style() {
         let skin = MadSkin::default();
         let t = markdown_transcript_text("# Title here", 40, &skin);
-        assert!(!t.lines.is_empty());
+        assert_ne!(t.lines, [] as [ratatui::prelude::Line<'_>; 0]);
         let joined: String = t
             .lines
             .iter()

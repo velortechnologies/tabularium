@@ -20,6 +20,7 @@ pub fn validate_chat_speaker_id(id: impl AsRef<str>) -> Result<()> {
 }
 
 /// Escape backslashes and `#` so a speaker id is safe inside a single-line ATX markdown heading.
+#[cfg(any(feature = "db", test))]
 pub(crate) fn escape_chat_heading_label(id: &str) -> String {
     let mut s = String::with_capacity(id.len());
     for ch in id.chars() {

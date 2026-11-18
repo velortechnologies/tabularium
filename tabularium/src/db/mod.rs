@@ -1,5 +1,9 @@
 //! Database facade: `Storage` + Tantivy + read-through cache (`moka`).
 mod blob;
+mod indexing;
+mod jobs;
+pub use indexing::IndexState;
+pub use jobs::{ReindexJob, ReindexOptions};
 mod snapshots;
 
 mod entry_kind;
@@ -82,6 +86,8 @@ pub enum DocumentWaitStatus {
 /// Async façade over storage, search index, and document body cache.
 pub struct Database<S: Storage> {
     storage: S,
+    indexing: indexing::Indexing,
+    jobs: jobs::Jobs,
     search: SearchIndex,
     semantic: Option<Arc<semantic::SemanticIndex>>,
     cache: Cache<EntryId, String>,
@@ -137,6 +143,8 @@ impl SqliteDatabase {
         let cache = Cache::builder().max_capacity(cache_size.max(1)).build();
         let db = Database {
             storage,
+            indexing: indexing::Indexing::open(index_path.as_ref()).await?,
+            jobs: jobs::Jobs::default(),
             search,
             semantic: None,
             cache,
@@ -275,19 +283,14 @@ impl<S: Storage> Database<S> {
             .storage
             .files_for_search_reindex(Some(directory_path))
             .await?;
-        self.search.upsert_batch(&rows).await?;
         for (id, _, _, _, _) in rows {
-            self.queue_semantic(id).await;
+            self.inline_index(id).await;
         }
         Ok(())
     }
 
     async fn reindex_file_in_search(&self, file_id: EntryId) -> Result<()> {
-        let (dp, name, desc, content) = self.storage.file_search_index_fields(file_id).await?;
-        self.search
-            .upsert_file(file_id, &dp, &name, &desc, &content)
-            .await?;
-        self.queue_semantic(file_id).await;
+        self.inline_index(file_id).await;
         Ok(())
     }
 
@@ -512,8 +515,7 @@ impl<S: Storage> Database<S> {
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     pub async fn delete_document(&self, file_id: EntryId) -> Result<()> {
         self.storage.delete_file(file_id).await?;
-        self.search.delete_file(file_id).await?;
-        self.queue_semantic(file_id).await;
+        self.remove_from_indexes(file_id).await?;
         self.cache.invalidate(&file_id).await;
         self.doc_wait.remove(&file_id);
         self.doc_append_locks.remove(&file_id);
@@ -742,23 +744,12 @@ impl<S: Storage> Database<S> {
 
     #[instrument(skip(self), fields(directory = ?directory_path_filter), err(Debug))]
     pub async fn reindex(&self, directory_path_filter: Option<&str>) -> Result<()> {
-        let rows = self
-            .storage
-            .files_for_search_reindex(directory_path_filter)
-            .await?;
-        let n = rows.len();
-        match directory_path_filter {
-            None | Some("" | "/") => self.search.replace_all_from_rows(&rows).await?,
-            Some(_) => self.search.upsert_batch(&rows).await?,
-        }
-        tracing::debug!(
-            target: "tabularium::db",
-            doc_count = n,
-            full = directory_path_filter.is_none()
-                || directory_path_filter.is_some_and(|s| s.is_empty() || s == "/"),
-            "reindex complete"
-        );
-        Ok(())
+        self.reindex_selected(
+            directory_path_filter.unwrap_or("/"),
+            crate::SearchKind::Lexical,
+            false,
+        )
+        .await
     }
 }
 
@@ -859,7 +850,7 @@ mod tests {
         let body2 = db.get_document(id).await.unwrap();
         assert_eq!(body2, "omega psi");
         let hits2 = db.search("beta", None).await.unwrap();
-        assert!(hits2.is_empty());
+        assert_eq!(hits2, [] as [crate::db::EntryId; 0]);
         let hits3 = db.search("omega", None).await.unwrap();
         assert_eq!(hits3, vec![id]);
     }
@@ -907,7 +898,10 @@ mod tests {
             .unwrap();
         assert!(db.search("ledger_alpha", None).await.unwrap().contains(&id));
         assert!(db.search("boring", None).await.unwrap().contains(&id));
-        assert!(db.search("heretek_marker", None).await.unwrap().is_empty());
+        assert_eq!(
+            db.search("heretek_marker", None).await.unwrap(),
+            [] as [crate::db::EntryId; 0]
+        );
         db.set_entry_description("/d/ledger_alpha.md", Some("heretek_marker chronicle"))
             .await
             .unwrap();
@@ -920,7 +914,10 @@ mod tests {
         db.set_entry_description("/d/ledger_alpha.md", None)
             .await
             .unwrap();
-        assert!(db.search("heretek_marker", None).await.unwrap().is_empty());
+        assert_eq!(
+            db.search("heretek_marker", None).await.unwrap(),
+            [] as [crate::db::EntryId; 0]
+        );
     }
 
     #[tokio::test]

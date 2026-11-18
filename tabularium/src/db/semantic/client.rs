@@ -20,7 +20,7 @@ pub struct SemanticConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub index_dir: Option<PathBuf>,
-    #[serde(default = "timeout")]
+    #[serde(default = "timeout", rename = "llm_timeout", alias = "timeout")]
     pub timeout: u64,
     #[serde(default = "search_timeout")]
     pub search_timeout: u64,
@@ -167,6 +167,11 @@ impl EmbeddingsClient {
                     .into(),
                 )
             })?;
+        if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(Error::InvalidInput(
+                "embedding document exceeds endpoint input limit".into(),
+            ));
+        }
         if !response.status().is_success() {
             return Err(Error::Search(format!(
                 "embeddings HTTP {}; check model, headers, and input limits",
@@ -213,7 +218,12 @@ impl EmbeddingsClient {
             out[row.index] = Some(
                 row.embedding
                     .into_iter()
-                    .map(|v| (f64::from(v) / norm) as f32)
+                    .map(|v| {
+                        // Normalized components lie in [-1, 1]; store vectors as f32.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let normalized = (f64::from(v) / norm) as f32;
+                        normalized
+                    })
                     .collect(),
             );
         }

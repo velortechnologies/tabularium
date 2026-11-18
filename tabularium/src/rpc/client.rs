@@ -49,7 +49,7 @@ impl Client {
         {
             let mut segments = url
                 .path_segments_mut()
-                .map_err(|_| Error::InvalidInput("invalid base URL".into()))?;
+                .map_err(|()| Error::InvalidInput("invalid base URL".into()))?;
             for segment in path.trim_start_matches('/').split('/') {
                 segments.push(segment);
             }
@@ -902,26 +902,12 @@ impl Client {
         Ok(())
     }
 
-    /// `reindex` RPC. `None` rebuilds the whole index from SQLite.
-    pub async fn reindex(&self, path: Option<&Path>) -> Result<()> {
-        self.reindex_with_kind(path, crate::SearchKind::default())
-            .await
-    }
-
-    /// Rebuild the selected engine(s); embedding a full corpus can take minutes.
-    pub async fn reindex_with_kind(
-        &self,
-        path: Option<&Path>,
-        kind: crate::SearchKind,
-    ) -> Result<()> {
-        let mut params = json!({"kind":kind});
-        if let Some(path) = path {
-            params["path"] = json!(normalize_path_for_rpc(path)?);
+    /// Invoke one of the administrative in-memory reindex job operations.
+    pub async fn reindex_job(&self, action: &str, params: Value) -> Result<Value> {
+        if !matches!(action, "start" | "explain" | "list" | "status" | "stop") {
+            return Err(Error::InvalidInput("unknown reindex job action".into()));
         }
-        self.with_timeout(Duration::from_secs(3600))?
-            .call("reindex", params)
-            .await?;
-        Ok(())
+        self.call(&format!("reindex_job_{action}"), params).await
     }
 }
 

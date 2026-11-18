@@ -6,6 +6,7 @@ use crate::db::WcStats;
 
 /// Which `wc` metrics to include in RPC/CLI output.
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent wc column switches, not state flags.
 pub struct WcMetricsFilter {
     /// Indicator whether line counts are included.
     pub lines: bool,
@@ -62,6 +63,7 @@ impl WcMetricsFilter {
     }
 
     /// Builds a filter from CLI `-l`/`-w`/`-c`/`-m`; with no flags, uses [`Self::posix_default`].
+    #[allow(clippy::fn_params_excessive_bools)] // Mirrors the four independent CLI switches.
     pub fn from_cli_flags(lines: bool, words: bool, bytes: bool, chars: bool) -> Self {
         if !lines && !words && !bytes && !chars {
             return Self::posix_default();
@@ -135,7 +137,7 @@ impl WcMetricsFilter {
     }
 }
 
-fn wc_metrics_object(stats: &WcStats, filter: &WcMetricsFilter) -> Map<String, Value> {
+fn wc_metrics_object(stats: &WcStats, filter: WcMetricsFilter) -> Map<String, Value> {
     let mut m = Map::new();
     if filter.lines {
         m.insert("lines".into(), json!(stats.lines()));
@@ -154,12 +156,12 @@ fn wc_metrics_object(stats: &WcStats, filter: &WcMetricsFilter) -> Map<String, V
 
 /// Builds a JSON object of filtered metrics from [`WcStats`].
 pub fn wc_stats_to_value(stats: &WcStats, filter: &WcMetricsFilter) -> Value {
-    Value::Object(wc_metrics_object(stats, filter))
+    Value::Object(wc_metrics_object(stats, *filter))
 }
 
 /// Builds a JSON file row (`path` plus filtered metrics).
 pub fn wc_file_to_value(path: &str, stats: &WcStats, filter: &WcMetricsFilter) -> Value {
-    let mut m = wc_metrics_object(stats, filter);
+    let mut m = wc_metrics_object(stats, *filter);
     m.insert("path".into(), json!(path));
     Value::Object(m)
 }

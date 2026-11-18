@@ -4,6 +4,7 @@ use sqlx::{Row, SqlitePool};
 
 const SCHEMA_VERSION: i64 = 1;
 
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -48,7 +49,7 @@ pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
         tracing::info!(entry_id = id, old_name = %old, new_name = %name, "snapshot namespace migration");
     }
     // Snapshots reserve IDs from the live entries sequence, avoiding collisions.
-    sqlx::raw_sql(r#"
+    sqlx::raw_sql(r"
 CREATE TABLE snapshot_contents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL
@@ -117,7 +118,7 @@ s.blob_revision, s.source_id, s.name
 FROM snapshots s JOIN entries e ON e.id = s.source_id
 LEFT JOIN snapshot_contents c ON c.id = s.content_id;
 PRAGMA user_version = 1;
-"#).execute(&mut *tx).await?;
+").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }

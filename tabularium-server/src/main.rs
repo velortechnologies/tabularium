@@ -45,9 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&cfg.server.index_dir)?;
 
     let worker_threads = if cfg.server.workers == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     } else {
         cfg.server.workers as usize
     };
@@ -62,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     result
 }
 
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn run(
     cfg: config::Config,
     telemetry: &Telemetry,
@@ -93,7 +92,10 @@ async fn run(
             .await?;
     }
     let db = Arc::new(db);
-    db.start_semantic_worker();
+    let _auto_reindex = cfg
+        .auto_reindex
+        .map(|seconds| db.start_auto_reindex(seconds.get()))
+        .transpose()?;
     let wait_timeout = Duration::from_secs(cfg.server.timeout.max(1));
     let oidc = match cfg.oidc.as_ref() {
         None => None,

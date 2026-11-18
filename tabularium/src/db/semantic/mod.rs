@@ -9,15 +9,11 @@ use client::EmbeddingsClient;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
 
 pub(super) struct SemanticIndex {
     pub config: SemanticConfig,
     pool: SqlitePool,
     client: EmbeddingsClient,
-    pub operation: Mutex<()>,
-    pub wake: Arc<Notify>,
 }
 
 pub(super) struct SemanticDocument {
@@ -65,8 +61,6 @@ impl SemanticIndex {
             config,
             pool,
             client,
-            operation: Mutex::new(()),
-            wake: Arc::new(Notify::new()),
         })
     }
     async fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -91,11 +85,11 @@ impl SemanticIndex {
             }
         }
     }
-    pub async fn queue(&self, id: i64) -> Result<()> {
+    pub async fn mark_pending(&self, id: i64) -> Result<()> {
         sqlx::query("INSERT INTO dirty(id,generation) VALUES(?,1) ON CONFLICT(id) DO UPDATE SET generation=generation+1").bind(id).execute(&self.pool).await?;
-        self.wake.notify_one();
         Ok(())
     }
+    #[cfg(test)]
     pub async fn pending(&self, limit: i64) -> Result<Vec<(i64, i64)>> {
         Ok(
             sqlx::query_as("SELECT id,generation FROM dirty ORDER BY id LIMIT ?")
@@ -104,6 +98,7 @@ impl SemanticIndex {
                 .await?,
         )
     }
+    #[cfg(test)]
     pub async fn acknowledge(&self, id: i64, generation: i64) -> Result<()> {
         sqlx::query("DELETE FROM dirty WHERE id=? AND generation=?")
             .bind(id)
@@ -112,25 +107,29 @@ impl SemanticIndex {
             .await?;
         Ok(())
     }
+    #[cfg(test)]
     pub async fn indexed_ids(&self) -> Result<Vec<i64>> {
         Ok(sqlx::query_scalar("SELECT id FROM docs")
             .fetch_all(&self.pool)
             .await?)
     }
     pub async fn matches(&self, doc: &SemanticDocument) -> Result<bool> {
+        if matches!(self.state().await?, "unindexed" | "incompatible") {
+            return Ok(false);
+        }
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dirty WHERE id=?)")
+            .bind(doc.id)
+            .fetch_one(&self.pool)
+            .await?;
+        if pending {
+            return Ok(false);
+        }
         let value: Option<(String, String)> =
             sqlx::query_as("SELECT path,revision FROM docs WHERE id=?")
                 .bind(doc.id)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(value.is_some_and(|(p, r)| p == doc.path && r == doc.revision))
-    }
-    pub async fn remove(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM docs WHERE id=?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
     pub async fn forget(&self, id: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -145,6 +144,29 @@ impl SemanticIndex {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Called only with the façade's shared indexing mutex held.
+    pub async fn replace_one(&self, doc: &SemanticDocument) -> Result<()> {
+        let reset = matches!(self.state().await?, "unindexed" | "incompatible");
+        self.replace(std::slice::from_ref(doc), None, reset).await?;
+        if reset {
+            sqlx::query("INSERT OR REPLACE INTO meta(key,value) VALUES('complete','false')")
+                .execute(&self.pool)
+                .await?;
+        }
+        sqlx::query("DELETE FROM dirty WHERE id=?")
+            .bind(doc.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_complete(&self) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO meta(key,value) VALUES('complete','true')")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -274,8 +296,8 @@ impl SemanticIndex {
         for ((id, c), vector) in chunks.iter().zip(vectors) {
             let bytes: Vec<u8> = vector.into_iter().flat_map(f32::to_le_bytes).collect();
             sqlx::query("INSERT INTO staging_chunks(doc_id,start,end,line_start,line_end,vector) VALUES(?,?,?,?,?,?)")
-                .bind(id).bind(c.start as i64).bind(c.end as i64)
-                .bind(c.line_start as i64).bind(c.line_end as i64).bind(bytes)
+                .bind(id).bind(i64::try_from(c.start).map_err(|_| Error::Search("semantic offset exceeds i64".into()))?).bind(i64::try_from(c.end).map_err(|_| Error::Search("semantic offset exceeds i64".into()))?)
+                .bind(i64::try_from(c.line_start).map_err(|_| Error::Search("semantic offset exceeds i64".into()))?).bind(i64::try_from(c.line_end).map_err(|_| Error::Search("semantic offset exceeds i64".into()))?).bind(bytes)
                 .execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -317,8 +339,8 @@ impl SemanticIndex {
                 ));
             }
             let mut score = 0.0;
-            for (part, &v) in bytes.chunks_exact(4).zip(q) {
-                score += f32::from_le_bytes(part.try_into().expect("four-byte chunk")) * v;
+            for (part, &v) in bytes.as_chunks::<4>().0.iter().zip(q) {
+                score += f32::from_le_bytes(*part) * v;
             }
             if !score.is_finite() {
                 return Err(Error::Search(
@@ -337,10 +359,14 @@ impl SemanticIndex {
             out.push(SemanticCandidate {
                 id: row.try_get("doc_id")?,
                 revision: row.try_get("revision")?,
-                start: start as usize,
-                end: end as usize,
-                line_start: ls as usize,
-                line_end: le as usize,
+                start: usize::try_from(start)
+                    .map_err(|_| Error::Search("invalid semantic offset".into()))?,
+                end: usize::try_from(end)
+                    .map_err(|_| Error::Search("invalid semantic offset".into()))?,
+                line_start: usize::try_from(ls)
+                    .map_err(|_| Error::Search("invalid semantic offset".into()))?,
+                line_end: usize::try_from(le)
+                    .map_err(|_| Error::Search("invalid semantic offset".into()))?,
                 score,
             });
         }

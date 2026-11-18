@@ -43,7 +43,7 @@ async fn rpc_returns_unauthorized_when_authenticate_true_and_missing_key() {
         .unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::OK);
     let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v["error"]["code"], UNAUTHORIZED as i64);
+    assert_eq!(v["error"]["code"], i64::from(UNAUTHORIZED));
 }
 
 #[tokio::test]

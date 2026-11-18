@@ -11,6 +11,9 @@ use tabularium::{AclBodyJson, Error, Result};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerSection,
+    /// Optional root missing-only reindex interval in seconds.
+    #[serde(default)]
+    pub auto_reindex: Option<std::num::NonZeroU64>,
     /// Optional OpenAI-compatible embeddings endpoint and derived sidecar.
     #[serde(default)]
     pub semantic: Option<tabularium::SemanticConfig>,
@@ -132,4 +135,29 @@ pub fn load(path: &Path) -> Result<Config> {
         )?;
     }
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod indexing_config_tests {
+    use super::*;
+    fn base() -> &'static str {
+        "[server]\nlisten='127.0.0.1:3050'\ndatabase_path='test.db'\nindex_dir='index'\nworkers=1\n"
+    }
+    #[test]
+    fn auto_reindex_is_optional_and_nonzero() {
+        let cfg: Config = toml::from_str(base()).unwrap();
+        assert!(cfg.auto_reindex.is_none());
+        assert!(toml::from_str::<Config>(&format!("auto_reindex=0\n{}", base())).is_err());
+        let cfg: Config = toml::from_str(&format!("auto_reindex=900\n{}", base())).unwrap();
+        assert_eq!(cfg.auto_reindex.unwrap().get(), 900);
+    }
+    #[test]
+    fn separate_llm_timeout_and_legacy_alias() {
+        for key in ["llm_timeout", "timeout"] {
+            let cfg: Config = toml::from_str(&format!("{}\n[semantic]\nbase_url='http://localhost:8011/v1'\nmodel='test'\n{key}=7\nsearch_timeout=2\n",base())).unwrap();
+            let semantic = cfg.semantic.unwrap();
+            assert_eq!(semantic.timeout, 7);
+            assert_eq!(semantic.search_timeout, 2);
+        }
+    }
 }

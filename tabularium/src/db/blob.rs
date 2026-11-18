@@ -85,12 +85,12 @@ mod tests {
         let generation = uuid::Uuid::new_v4().to_string();
         let temp = dir.path().join("upload");
         std::fs::write(&temp, [0, 255, 17]).unwrap();
-        let path = store.publish(&temp, 1234567.into(), &generation).unwrap();
+        let path = store.publish(&temp, 1_234_567.into(), &generation).unwrap();
         assert!(path.ends_with(format!("001/234/1234567.{generation}")));
         let mut reader = std::fs::File::open(&path).unwrap();
         std::fs::write(&temp, b"replacement").unwrap();
-        assert!(store.publish(&temp, 1234567.into(), &generation).is_err());
-        store.remove(1234567.into(), &generation).unwrap();
+        assert!(store.publish(&temp, 1_234_567.into(), &generation).is_err());
+        store.remove(1_234_567.into(), &generation).unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, [0, 255, 17]);

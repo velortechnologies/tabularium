@@ -98,11 +98,11 @@ async fn hybrid_headers_quotes_acl_and_failed_api() {
         .search_report("recover", None, 10, None, SearchKind::Hybrid, None)
         .await
         .unwrap();
-    assert_eq!(before.semantic_status(), "unindexed");
+    assert_eq!(before.semantic_status(), "partial");
     assert!(
         db.search_report("recover", None, 10, None, SearchKind::Semantic, None)
             .await
-            .is_err()
+            .is_ok()
     );
     db.reindex_kind(None, SearchKind::Hybrid).await.unwrap();
     while db.flush_semantic_pending().await.unwrap() > 0 {}
@@ -145,7 +145,7 @@ async fn hybrid_headers_quotes_acl_and_failed_api() {
 }
 
 #[tokio::test]
-async fn stale_revision_retry_delete_move_and_persisted_queue() {
+async fn stale_revision_retry_delete_move_and_persisted_state() {
     let temp = tempfile::tempdir().unwrap();
     let (url, offline, task) = mock().await;
     let db = open(temp.path(), &url).await;
@@ -209,7 +209,7 @@ async fn stale_revision_retry_delete_move_and_persisted_queue() {
 }
 
 #[tokio::test]
-async fn model_fingerprint_requires_explicit_full_rebuild() {
+async fn model_fingerprint_invalidates_old_index() {
     let temp = tempfile::tempdir().unwrap();
     let (url, _, task) = mock().await;
     let db = open(temp.path(), &url).await;
@@ -287,7 +287,7 @@ async fn failed_rebuild_preserves_active_index_and_scoped_reindex_isolated() {
         .unwrap();
     assert_eq!(r.hits()[0].path(), "/ab/doc");
     let index = db.semantic.as_ref().unwrap();
-    index.queue(999).await.unwrap();
+    index.mark_pending(999).await.unwrap();
     let generation = index
         .pending(16)
         .await
@@ -296,7 +296,7 @@ async fn failed_rebuild_preserves_active_index_and_scoped_reindex_isolated() {
         .find(|(id, _)| *id == 999)
         .unwrap()
         .1;
-    index.queue(999).await.unwrap();
+    index.mark_pending(999).await.unwrap();
     index.acknowledge(999, generation).await.unwrap();
     assert!(
         index
@@ -453,8 +453,8 @@ async fn search_time_order_filters_ties_and_semantic_excerpts() {
         let (text, revision) = db
             .document_slice_versioned(
                 hit.document_id(),
-                hit.start_line().unwrap() as u32,
-                hit.line_end().unwrap() as u32,
+                u32::try_from(hit.start_line().unwrap()).unwrap(),
+                u32::try_from(hit.line_end().unwrap()).unwrap(),
                 hit.revision(),
             )
             .await
@@ -485,6 +485,7 @@ async fn search_time_order_filters_ties_and_semantic_excerpts() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn snapshots_semantic_filter_move_and_delete() {
     let temp = tempfile::tempdir().unwrap();
     let (url, _, task) = mock().await;
@@ -604,4 +605,340 @@ async fn snapshots_semantic_filter_move_and_delete() {
         .unwrap();
     assert!(history.hits().is_empty());
     task.abort();
+}
+
+async fn wait_jobs(db: &SqliteDatabase) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !db.reindex_jobs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("job completion");
+}
+fn missing_options() -> ReindexOptions {
+    ReindexOptions {
+        path: "/".into(),
+        non_indexed_only: true,
+        indexer_kind: SearchKind::Hybrid,
+    }
+}
+
+/// Owner's mandatory practical scenario, exercising actual HTTP endpoint failure.
+#[tokio::test]
+async fn outage_create_update_metadata_then_missing_job_repairs_six_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, offline, task) = mock().await;
+    let db = Arc::new(open(temp.path(), &url).await);
+    db.create_directory("/outage", None, false).await.unwrap();
+    let mut ids = Vec::new();
+    for name in ["body1", "body2", "meta1", "meta2"] {
+        ids.push(
+            db.create_document_at_path(format!("/outage/{name}"), "old cake", false, None)
+                .await
+                .unwrap(),
+        );
+    }
+    let control = db
+        .create_document_at_path("/outage/control", "unchanged cake", false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.document_index_state(control).await.unwrap().semantic,
+        "ready"
+    );
+    offline.store(true, Ordering::SeqCst);
+    for id in &ids[..2] {
+        db.update_document(*id, "backup changed").await.unwrap();
+    }
+    for name in ["meta1", "meta2"] {
+        db.set_document_metadata(
+            &format!("/outage/{name}"),
+            &json!({"note":"newmetadata"}),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    for name in ["new1", "new2"] {
+        ids.push(
+            db.create_document_at_path(format!("/outage/{name}"), "backup new", false, None)
+                .await
+                .unwrap(),
+        );
+    }
+    for id in &ids {
+        let state = db.document_index_state(*id).await.unwrap();
+        assert_eq!(state.lexical, "ready");
+        assert_eq!(state.semantic, "pending");
+        assert_ne!(db.get_document(*id).await.unwrap(), "");
+    }
+    assert_eq!(
+        db.reindex_explain(&missing_options()).await.unwrap().len(),
+        6
+    );
+    assert_eq!(
+        db.document_index_state(control).await.unwrap().semantic,
+        "ready"
+    );
+    // Outage is an engine error: a job must terminate, not stay in a retry loop.
+    db.reindex_job_start(missing_options()).await.unwrap();
+    wait_jobs(&db).await;
+    assert_eq!(
+        db.reindex_explain(&missing_options()).await.unwrap().len(),
+        6
+    );
+    assert_eq!(db.indexing.active(), 0);
+    offline.store(false, Ordering::SeqCst);
+    db.reindex_job_start(missing_options()).await.unwrap();
+    wait_jobs(&db).await;
+    assert!(
+        db.reindex_explain(&missing_options())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for id in ids {
+        assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
+    }
+    assert_eq!(
+        db.search_report("newmetadata", None, 20, None, SearchKind::Lexical, None)
+            .await
+            .unwrap()
+            .hits()
+            .len(),
+        2
+    );
+    assert_eq!(
+        db.search_report("backup", None, 20, None, SearchKind::Semantic, None)
+            .await
+            .unwrap()
+            .hits()
+            .len(),
+        7
+    );
+    assert_eq!(db.indexing.active(), 0);
+    assert!(db.reindex_jobs().is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn llm_timeout_releases_inline_operation_and_can_recover() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let hung = Arc::new(AtomicBool::new(true));
+    let h = hung.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/embeddings",
+                post(move || {
+                    let h = h.clone();
+                    async move {
+                        if h.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                        Json(json!({"data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}))
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config(&url);
+    cfg.timeout = 1;
+    let db = SqliteDatabase::init(
+        format!("sqlite://{}", temp.path().join("source.db").display()),
+        temp.path().join("lex"),
+        0,
+    )
+    .await
+    .unwrap()
+    .with_semantic(cfg, &temp.path().join("sem"))
+    .await
+    .unwrap();
+    let id = tokio::time::timeout(
+        Duration::from_secs(5),
+        db.create_document_at_path("/hung", "backup", false, None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        db.document_index_state(id).await.unwrap().semantic,
+        "pending"
+    );
+    assert_eq!(db.indexing.active(), 0);
+    assert!(db.indexing.mutex.try_lock().is_ok());
+    hung.store(false, Ordering::SeqCst);
+    db.reindex_selected("/", SearchKind::Semantic, true)
+        .await
+        .unwrap();
+    assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
+    assert_eq!(db.indexing.active(), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn document_failure_skips_but_model_failure_stops_before_next_document() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let status = Arc::new(std::sync::atomic::AtomicUsize::new(413));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let c = counter.clone();
+    let s = status.clone();
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(move |Json(body): Json<Value>| {
+            let c = c.clone();
+            let s = s.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                if body["input"][0].as_str().unwrap().contains("bad") {
+                    StatusCode::from_u16(u16::try_from(s.load(Ordering::SeqCst)).unwrap())
+                        .unwrap()
+                        .into_response()
+                } else {
+                    Json(json!({"data":[{"index":0,"embedding":[1.0,0.0,0.0]}]})).into_response()
+                }
+            }
+        }),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(open(temp.path(), &url).await);
+    let bad = db.storage.create_file("/bad", "bad input").await.unwrap();
+    let good = db
+        .storage
+        .create_file("/good", "valid input")
+        .await
+        .unwrap();
+    db.reindex_job_start(missing_options()).await.unwrap();
+    wait_jobs(&db).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        db.document_index_state(bad).await.unwrap().semantic,
+        "pending"
+    );
+    assert_eq!(
+        db.document_index_state(good).await.unwrap().semantic,
+        "ready"
+    );
+    status.store(503, Ordering::SeqCst);
+    counter.store(0, Ordering::SeqCst);
+    db.storage.update_file(good, "changed").await.unwrap();
+    db.reindex_job_start(missing_options()).await.unwrap();
+    wait_jobs(&db).await;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "engine outage must stop the pass"
+    );
+    assert_eq!(
+        db.document_index_state(good).await.unwrap().semantic,
+        "pending"
+    );
+    assert_eq!(db.indexing.active(), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn stop_waits_for_inflight_commit_and_old_revision_stays_pending() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let e = entered.clone();
+    let r = release.clone();
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let e = e.clone();
+            let r = r.clone();
+            async move {
+                e.notify_one();
+                r.notified().await;
+                Json(json!({"data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}))
+            }
+        }),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(open(temp.path(), &url).await);
+    let id = db.storage.create_file("/race", "old").await.unwrap();
+    let job = db.reindex_job_start(missing_options()).await.unwrap();
+    entered.notified().await;
+    db.storage.update_file(id, "new").await.unwrap();
+    let d = db.clone();
+    let j = job.clone();
+    let stop = tokio::spawn(async move { d.reindex_job_stop(&j).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!stop.is_finished());
+    release.notify_one();
+    stop.await.unwrap().unwrap();
+    assert!(db.reindex_job_status(&job).is_err());
+    assert_eq!(
+        db.document_index_state(id).await.unwrap().semantic,
+        "pending"
+    );
+    assert_eq!(db.indexing.active(), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn time_slice_allows_api_write_to_pass_large_job() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let e = entered.clone();
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let e = e.clone();
+            async move {
+                e.notify_one();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                Json(json!({"data":[{"index":0,"embedding":[1.0,0.0,0.0]}]}))
+            }
+        }),
+    );
+    let endpoint = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(open(temp.path(), &url).await);
+    for i in 0..8 {
+        db.storage
+            .create_file(&format!("/large{i}"), "text")
+            .await
+            .unwrap();
+    }
+    let job = db.reindex_job_start(missing_options()).await.unwrap();
+    entered.notified().await;
+    let other = db.clone();
+    let write = tokio::spawn(async move {
+        other
+            .create_document_at_path("/small", "text", false, None)
+            .await
+    });
+    let id = tokio::time::timeout(Duration::from_secs(5), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
+    assert!(
+        db.reindex_job_status(&job).is_ok(),
+        "API must pass before large job finishes"
+    );
+    db.reindex_job_stop(&job).await.unwrap();
+    assert_eq!(db.indexing.active(), 0);
+    endpoint.abort();
 }

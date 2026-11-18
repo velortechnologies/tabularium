@@ -167,7 +167,7 @@ pub(crate) async fn resolve_request_auth_arc(
         db,
         authenticate,
         headers,
-        oidc.map(|a| a.as_ref()),
+        oidc.map(std::convert::AsRef::as_ref),
         anonymous,
     )
     .await

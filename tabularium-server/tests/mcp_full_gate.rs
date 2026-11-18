@@ -51,7 +51,7 @@ async fn mcp_standard_registers_document_operations_but_not_admin() {
     ] {
         assert!(mcp.has_mcp_tool(name), "{name}");
     }
-    assert!(!mcp.has_mcp_tool("reindex"));
+    assert!(!mcp.has_mcp_tool("reindex_job_start"));
     assert!(mcp.has_mcp_tool("get_document"));
     assert!(mcp.has_mcp_tool("list_directory"));
     assert!(mcp.has_mcp_tool("append_if_not_contains"));
@@ -70,7 +70,7 @@ async fn mcp_full_true_registers_destructive_tools() {
     assert!(mcp.has_mcp_tool("rename_directory"));
     assert!(mcp.has_mcp_tool("move_document"));
     assert!(mcp.has_mcp_tool("move_directory"));
-    assert!(mcp.has_mcp_tool("reindex"));
+    assert!(mcp.has_mcp_tool("reindex_job_start"));
     assert!(mcp.has_mcp_tool("whoami"));
     assert!(mcp.has_mcp_tool("acl_list"));
     assert!(mcp.has_mcp_tool("acl_destroy"));

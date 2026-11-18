@@ -713,6 +713,7 @@ async fn rpc_delete_nonempty_directory_fails() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
 async fn rpc_describe_get_set_clear_on_directory_and_file() {
     let s = spawn_test_server().await;
     let base = &s.base_url;

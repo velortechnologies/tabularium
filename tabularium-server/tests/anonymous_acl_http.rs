@@ -182,7 +182,7 @@ async fn anonymous_rpc_admin_forbidden_admin_psk_ok() {
         .await
         .unwrap();
     let v: serde_json::Value = denied.json().await.unwrap();
-    assert_eq!(v["error"]["code"], FORBIDDEN as i64);
+    assert_eq!(v["error"]["code"], i64::from(FORBIDDEN));
 
     let ok = c
         .post(format!("{base}/rpc"))
@@ -209,7 +209,7 @@ async fn anonymous_rpc_admin_forbidden_admin_psk_ok() {
     let v: serde_json::Value = miss.json().await.unwrap();
     // Forbidden for anonymous path deny (may surface as -32004).
     assert!(
-        v["error"]["code"] == FORBIDDEN as i64 || v["error"]["code"] == UNAUTHORIZED as i64,
+        v["error"]["code"] == i64::from(FORBIDDEN) || v["error"]["code"] == i64::from(UNAUTHORIZED),
         "{v:?}"
     );
 }

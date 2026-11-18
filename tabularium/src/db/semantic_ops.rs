@@ -43,14 +43,7 @@ impl<S: Storage> Database<S> {
         self.semantic = Some(Arc::new(SemanticIndex::open(config, default_dir).await?));
         Ok(self)
     }
-    pub(super) async fn queue_semantic(&self, id: EntryId) {
-        if let Some(index) = &self.semantic
-            && let Err(e) = index.queue(id.raw()).await
-        {
-            tracing::warn!(error=%e,"semantic refresh could not be queued; startup reconciliation or reindex required");
-        }
-    }
-    async fn semantic_document(&self, id: EntryId) -> Result<SemanticDocument> {
+    pub(super) async fn semantic_document(&self, id: EntryId) -> Result<SemanticDocument> {
         let before = self.storage.get_file_meta(id).await?;
         if before.is_binary() {
             return Err(Error::NotFound(id.to_string()));
@@ -60,7 +53,7 @@ impl<S: Storage> Database<S> {
         if before.revision() != after.revision()
             || before.canonical_path() != after.canonical_path()
         {
-            return Err(Error::Search(
+            return Err(Error::RevisionMismatch(
                 "document changed while preparing semantic index; retry".into(),
             ));
         }
@@ -74,116 +67,27 @@ impl<S: Storage> Database<S> {
             body,
         })
     }
-    /// Persistent dirty IDs survive restart; source revision/path checks prevent stale quotations.
-    pub fn start_semantic_worker(self: &Arc<Self>)
-    where
-        S: 'static,
-    {
-        let Some(index) = self.semantic.clone() else {
-            return;
-        };
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            // Recover writes that committed before a process died while queuing sidecar work.
-            if let Some(db) = weak.upgrade()
-                && matches!(index.state().await, Ok("ready" | "partial"))
-                && let Ok(rows) = db.storage.files_for_search_reindex(None).await
-            {
-                let mut ids: HashSet<i64> = rows.into_iter().map(|r| r.0.raw()).collect();
-                if let Ok(stored) = index.indexed_ids().await {
-                    ids.extend(stored);
-                }
-                for id in ids {
-                    if let Err(e) = index.queue(id).await {
-                        tracing::warn!(error=%e,"semantic startup reconciliation failed");
-                        break;
-                    }
-                }
-            }
-            loop {
-                let Some(db) = weak.upgrade() else { break };
-                let count = match db.flush_semantic_pending().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!(error=%e,"semantic refresh pending; will retry");
-                        0
-                    }
-                };
-                drop(db);
-                if count > 0 {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                tokio::select! {_ = index.wake.notified()=>{},_ = tokio::time::sleep(Duration::from_secs(5))=>{}}
-            }
-        });
-    }
-    /// Process one bounded batch. Primarily useful for maintenance and deterministic tests.
+    /// Explicit compatibility helper; no automatic background refresh is scheduled.
     pub async fn flush_semantic_pending(&self) -> Result<usize> {
-        let Some(index) = &self.semantic else {
+        if self.semantic.is_none() {
             return Ok(0);
+        }
+        let options = super::ReindexOptions {
+            path: "/".into(),
+            non_indexed_only: true,
+            indexer_kind: SearchKind::Semantic,
         };
-        let _guard = index.operation.lock().await;
-        if matches!(index.state().await?, "unindexed" | "incompatible") {
-            return Ok(0);
-        }
-        let pending = index.pending(16).await?;
-        let mut changed = Vec::new();
-        let mut done = Vec::new();
-        for &(id, generation) in &pending {
-            match self.semantic_document(EntryId::from(id)).await {
-                Ok(doc) => {
-                    if !index.matches(&doc).await? {
-                        changed.push(doc);
-                    }
-                    done.push((id, generation));
-                }
-                Err(Error::NotFound(_)) => {
-                    index.remove(id).await?;
-                    done.push((id, generation));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if !changed.is_empty() {
-            index.replace(&changed, None, false).await?;
-        }
-        for (id, generation) in done {
-            index.acknowledge(id, generation).await?;
-        }
-        Ok(pending.len())
+        let count = self.reindex_explain(&options).await?.len();
+        self.reindex_selected("/", SearchKind::Semantic, true)
+            .await?;
+        Ok(count)
     }
     /// Rebuild selected derived engines. Explicit semantic mode requires configuration.
     pub async fn reindex_kind(&self, path: Option<&str>, kind: SearchKind) -> Result<()> {
-        if kind == SearchKind::Semantic && self.semantic.is_none() {
-            return Err(Error::Search("semantic search is not configured".into()));
-        }
-        if kind != SearchKind::Semantic {
-            self.reindex(path).await?;
-        }
-        if kind != SearchKind::Lexical
-            && let Some(index) = &self.semantic
-        {
-            let _guard = index.operation.lock().await;
-            if path.is_some_and(|p| !p.is_empty() && p != "/")
-                && matches!(index.state().await?, "unindexed" | "incompatible")
-            {
-                return Err(Error::Search(
-                    "first semantic reindex, or a model change, requires full reindex /".into(),
-                ));
-            }
-            let rows = self.storage.files_for_search_reindex(path).await?;
-            let mut documents = Vec::with_capacity(rows.len());
-            for (id, _, _, _, _) in rows {
-                if !self.storage.get_file_meta(id).await?.is_binary() {
-                    documents.push(self.semantic_document(id).await?);
-                }
-            }
-            index.replace(&documents, path, true).await?;
-            index.wake.notify_one();
-        }
-        Ok(())
+        self.reindex_selected(path.unwrap_or("/"), kind, false)
+            .await
     }
+    #[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
     async fn semantic_hits(
         &self,
         query: &str,
@@ -345,6 +249,7 @@ impl<S: Storage> Database<S> {
 
     /// Filter and order authorized source-validated candidates before applying the result limit.
     #[allow(clippy::too_many_arguments)] // Additive variant keeps the existing public API compatible.
+    #[allow(clippy::too_many_lines)] // Keep the cohesive operation/scenario together.
     pub async fn search_report_with_options(
         &self,
         query: &str,
@@ -366,15 +271,13 @@ impl<S: Storage> Database<S> {
                 .await
         };
         let semantic = async {
-            if kind == SearchKind::Lexical || self.semantic.is_none() {
+            if kind == SearchKind::Lexical {
                 return Ok(Vec::new());
             }
-            let timeout = self
-                .semantic
-                .as_ref()
-                .expect("checked")
-                .config
-                .search_timeout;
+            let Some(engine) = self.semantic.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let timeout = engine.config.search_timeout;
             tokio::time::timeout(
                 Duration::from_secs(timeout),
                 self.semantic_hits(query, path, limit, only, auth, options),
@@ -429,8 +332,10 @@ impl<S: Storage> Database<S> {
             let mut scores: HashMap<i64, f32> = HashMap::new();
             for list in [&lex, &sem] {
                 for (rank, h) in list.iter().enumerate() {
-                    *scores.entry(h.document_id().raw()).or_default() +=
-                        1.0 / (60.0 + rank as f32 + 1.0);
+                    // RRF scores are approximate f32 weights; integer precision is not required.
+                    #[allow(clippy::cast_precision_loss)]
+                    let rank = rank as f32;
+                    *scores.entry(h.document_id().raw()).or_default() += 1.0 / (60.0 + rank + 1.0);
                 }
             }
             // Prefer the exact semantic excerpt for a document present in both lists.
@@ -466,10 +371,10 @@ impl<S: Storage> Database<S> {
         let has_more = hits.len() > requested_limit;
         hits.truncate(requested_limit);
         Ok(SearchReport {
-            has_more,
             hits,
             lexical_status,
             semantic_status,
+            has_more,
         })
     }
 }

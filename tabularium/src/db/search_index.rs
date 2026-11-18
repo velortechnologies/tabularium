@@ -170,8 +170,7 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Clear every indexed segment, then insert rows in one commit (full rebuild from SQLite).
-    #[instrument(skip(self, rows), fields(row_count = rows.len()), err(Debug))]
+    #[cfg(test)]
     pub async fn replace_all_from_rows(
         &self,
         rows: &[(EntryId, String, String, String, String)],
@@ -182,32 +181,6 @@ impl SearchIndex {
             let doc_u64 = u64::try_from(file_id.raw()).map_err(|_| {
                 Error::InvalidInput(format!("file id {} out of range", file_id.raw()))
             })?;
-            let d = doc!(
-                self.f_doc_id => doc_u64,
-                self.f_dir_path => dir_path.as_str(),
-                self.f_file_name => file_name.as_str(),
-                self.f_description => description.as_str(),
-                self.f_content => content.as_str(),
-            );
-            w.add_document(d)?;
-        }
-        w.commit()?;
-        drop(w);
-        self.reload_reader().await
-    }
-
-    /// Re-index a subset of files without wiping other indexed documents.
-    #[instrument(skip(self, rows), fields(row_count = rows.len()), err(Debug))]
-    pub async fn upsert_batch(
-        &self,
-        rows: &[(EntryId, String, String, String, String)],
-    ) -> Result<()> {
-        let mut w = self.writer.lock().await;
-        for (file_id, dir_path, file_name, description, content) in rows {
-            let doc_u64 = u64::try_from(file_id.raw()).map_err(|_| {
-                Error::InvalidInput(format!("file id {} out of range", file_id.raw()))
-            })?;
-            w.delete_term(Term::from_field_u64(self.f_doc_id, doc_u64));
             let d = doc!(
                 self.f_doc_id => doc_u64,
                 self.f_dir_path => dir_path.as_str(),
@@ -307,7 +280,10 @@ impl SearchIndex {
         let top = searcher
             .search(
                 &q,
-                &TopDocs::with_limit((searcher.num_docs() as usize).max(1)).order_by_score(),
+                &TopDocs::with_limit(
+                    (usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX)).max(1),
+                )
+                .order_by_score(),
             )
             .map_err(|e| Error::Search(e.to_string()))?;
         let mut out = Vec::with_capacity(top.len());
@@ -369,13 +345,19 @@ mod legacy_index_tests {
             index.search("legacytoken", Some("/one")).await.unwrap(),
             vec![EntryId::from(1)]
         );
-        assert!(index.search("deletedtoken", None).await.unwrap().is_empty());
+        assert_eq!(
+            index.search("deletedtoken", None).await.unwrap(),
+            [] as [crate::db::EntryId; 0]
+        );
         index
             .upsert_file(EntryId::from(1), "/one", "legacy.md", "", "newtoken")
             .await
             .unwrap();
         index.delete_file(EntryId::from(2)).await.unwrap();
-        assert!(index.search("legacytoken", None).await.unwrap().is_empty());
+        assert_eq!(
+            index.search("legacytoken", None).await.unwrap(),
+            [] as [crate::db::EntryId; 0]
+        );
         assert_eq!(
             index.search("newtoken", None).await.unwrap(),
             vec![EntryId::from(1)]
@@ -391,12 +373,15 @@ mod legacy_index_tests {
                 EntryId::from(4),
                 "/rebuilt".into(),
                 "rebuilt.md".into(),
-                "".into(),
+                String::new(),
                 "rebuilttoken".into(),
             )])
             .await
             .unwrap();
-        assert!(reopened.search("newtoken", None).await.unwrap().is_empty());
+        assert_eq!(
+            reopened.search("newtoken", None).await.unwrap(),
+            [] as [crate::db::EntryId; 0]
+        );
         assert_eq!(
             reopened.search("rebuilttoken", None).await.unwrap(),
             vec![EntryId::from(4)]

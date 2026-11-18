@@ -48,8 +48,9 @@ pub use client_headers::{
 pub use db::parse_user_timestamp;
 #[cfg(feature = "db")]
 pub use db::{
-    Database, DocumentMeta, DocumentWaitStatus, EntryId, EntryKind, GrepLine, ListedEntry,
-    SearchHit, SearchReport, SemanticConfig, SqliteDatabase, SqliteStorage, Storage, WcStats,
+    Database, DocumentMeta, DocumentWaitStatus, EntryId, EntryKind, GrepLine, IndexState,
+    ListedEntry, ReindexJob, ReindexOptions, SearchHit, SearchReport, SemanticConfig,
+    SqliteDatabase, SqliteStorage, Storage, WcStats,
 };
 pub use error::{Error, Result};
 #[cfg(feature = "client")]

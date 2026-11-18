@@ -34,6 +34,15 @@ pub(crate) fn launch(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn key() -> io::Result<bool> {
     use std::os::fd::AsRawFd;
+    struct Restore(i32, libc::termios);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: fd remains owned by tty, declared before this guard.
+            unsafe {
+                libc::tcsetattr(self.0, libc::TCSANOW, &raw const self.1);
+            }
+        }
+    }
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -41,25 +50,16 @@ fn key() -> io::Result<bool> {
     let fd = tty.as_raw_fd();
     // SAFETY: termios points to valid storage and fd remains open for this scope.
     let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+    if unsafe { libc::tcgetattr(fd, &raw mut original) } != 0 {
         return Err(io::Error::last_os_error());
-    }
-    struct Restore(i32, libc::termios);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: fd remains owned by tty, declared before this guard.
-            unsafe {
-                libc::tcsetattr(self.0, libc::TCSANOW, &self.1);
-            }
-        }
     }
     let _restore = Restore(fd, original);
     let mut raw = original;
     // SAFETY: valid termios and live fd.
     unsafe {
-        libc::cfmakeraw(&mut raw);
+        libc::cfmakeraw(&raw mut raw);
     }
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) } != 0 {
         return Err(io::Error::last_os_error());
     }
     eprint!("Press any key to edit again, Ctrl-C to exit");
