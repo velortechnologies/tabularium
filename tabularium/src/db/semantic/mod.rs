@@ -185,11 +185,14 @@ impl SemanticIndex {
         };
         let was_complete = self.meta("complete").await?;
         for doc in documents {
-            for c in chunk::split(
-                &doc.body,
-                self.config.chunk_bytes,
-                self.config.overlap_bytes,
-            ) {
+            // CPU-heavy preparation must not monopolize a single-worker server.
+            let body = doc.body.clone();
+            let size = self.config.chunk_bytes;
+            let overlap = self.config.overlap_bytes;
+            let prepared = tokio::task::spawn_blocking(move || chunk::split(&body, size, overlap))
+                .await
+                .map_err(|error| Error::Search(format!("semantic chunk worker failed: {error}")))?;
+            for c in prepared {
                 inputs.push(format!(
                     "{}{}",
                     self.config.document_prefix,

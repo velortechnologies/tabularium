@@ -11,6 +11,7 @@ pub(super) struct TextChunk {
 pub(super) fn split(body: &str, size: usize, overlap: usize) -> Vec<TextChunk> {
     let mut out = Vec::new();
     let mut start = 0;
+    let mut line_start = 1;
     while start < body.len() {
         let mut end = (start + size).min(body.len());
         while !body.is_char_boundary(end) {
@@ -30,7 +31,6 @@ pub(super) fn split(body: &str, size: usize, overlap: usize) -> Vec<TextChunk> {
             break;
         }
         if !body[start..end].trim().is_empty() {
-            let line_start = 1 + body[..start].bytes().filter(|&b| b == b'\n').count();
             let line_end = line_start
                 + body[start..end]
                     .trim_end_matches('\n')
@@ -51,6 +51,8 @@ pub(super) fn split(body: &str, size: usize, overlap: usize) -> Vec<TextChunk> {
         while next < end && !body.is_char_boundary(next) {
             next += 1;
         }
+        // Count each prefix byte once, not the whole document prefix per chunk.
+        line_start += body[start..next].bytes().filter(|&b| b == b'\n').count();
         start = next;
     }
     out
@@ -77,5 +79,51 @@ mod tests {
             assert!(w[1].start <= w[0].end);
             assert!(w[1].start > w[0].start);
         }
+    }
+    #[test]
+    fn incremental_line_numbers_match_prefix_reference() {
+        for text in [
+            "abc\n\n xyz\n",
+            "пташка 🖤\nперевірка\n",
+            "   \n\n\n",
+            "a\nb\nc\nd\n",
+            "single line",
+        ] {
+            let body = text.repeat(100);
+            for size in [16, 37, 64, 768] {
+                for overlap in [0, 3, size / 2, size - 1] {
+                    let chunks = split(&body, size, overlap);
+                    for c in &chunks {
+                        let expected_start =
+                            1 + body[..c.start].bytes().filter(|&b| b == b'\n').count();
+                        let expected_end = expected_start
+                            + body[c.start..c.end]
+                                .trim_end_matches('\n')
+                                .bytes()
+                                .filter(|&b| b == b'\n')
+                                .count();
+                        assert_eq!((c.line_start, c.line_end), (expected_start, expected_end));
+                        assert!(body.get(c.start..c.end).is_some());
+                    }
+                    for pair in chunks.windows(2) {
+                        assert!(pair[1].start > pair[0].start);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn large_document_chunking() {
+        let body = "IEEE specification line with unicode: перевірка.\n".repeat(500_000);
+        let at = std::time::Instant::now();
+        let chunks = split(&body, 768, 96);
+        eprintln!(
+            "{} bytes -> {} chunks in {:?}",
+            body.len(),
+            chunks.len(),
+            at.elapsed()
+        );
+        assert_eq!(chunks.last().unwrap().end, body.len());
+        assert_eq!(chunks.last().unwrap().line_end, 500_000);
     }
 }
