@@ -135,11 +135,23 @@ impl<S: Storage> Database<S> {
             .await?;
         // Rank authorized current metadata before reading source bodies.
         let mut eligible = Vec::new();
+        // Share candidate metadata across chunks, including missing documents.
+        // This cache is request-local; source validation below deliberately
+        // performs fresh reads so concurrent changes cannot emit stale quotes.
+        let mut metadata = HashMap::new();
         for c in candidates {
-            let meta = match self.storage.get_file_meta(EntryId::from(c.id)).await {
-                Ok(m) => m,
-                Err(Error::NotFound(_)) => continue,
-                Err(e) => return Err(e),
+            let cached = match metadata.entry(c.id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    match self.storage.get_file_meta(EntryId::from(c.id)).await {
+                        Ok(meta) => Some(meta),
+                        Err(Error::NotFound(_)) => None,
+                        Err(e) => return Err(e),
+                    },
+                ),
+            };
+            let Some(meta) = cached else {
+                continue;
             };
             let current_path = meta.canonical_path();
             if source_scope.as_deref().is_some_and(|source| {
@@ -162,7 +174,7 @@ impl<S: Storage> Database<S> {
             {
                 continue;
             }
-            eligible.push((c, meta));
+            eligible.push((c, meta.clone()));
         }
         eligible.sort_by(|a, b| {
             let order = match options.sort {

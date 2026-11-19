@@ -323,6 +323,8 @@ FROM flags f JOIN documents d ON d.id=f.id WHERE {eligibility} ORDER BY d.id"
 
 /// SQLite implementation of [`Storage`].
 pub struct SqliteStorage {
+    #[cfg(test)]
+    pub(super) metadata_reads: std::sync::atomic::AtomicUsize,
     pool: SqlitePool,
     blobs: super::blob::BlobStore,
 }
@@ -389,6 +391,8 @@ impl SqliteStorage {
         sqlx::query("CREATE TABLE IF NOT EXISTS browser_sessions (token_hash TEXT PRIMARY KEY, psk_id INTEGER NOT NULL REFERENCES access_keys(id) ON DELETE CASCADE)")
             .execute(&pool).await?;
         let storage = Self {
+            #[cfg(test)]
+            metadata_reads: std::sync::atomic::AtomicUsize::new(0),
             pool,
             blobs: super::blob::BlobStore::new(blob_root),
         };
@@ -1500,6 +1504,9 @@ impl Storage for SqliteStorage {
 
     #[instrument(skip(self), fields(file_id = file_id.raw()), err(Debug))]
     async fn get_file_meta(&self, file_id: EntryId) -> Result<DocumentMeta> {
+        #[cfg(test)]
+        self.metadata_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = sqlx::query(
             r"SELECT id, parent_id, name, created_at, modified_at, accessed_at, revision, size, mime_type, content_kind, sha256
             FROM readable_entries WHERE id = ? AND kind = 1",

@@ -967,3 +967,83 @@ async fn failed_forced_reindex_clears_persistent_semantic_flag() {
     assert_eq!(db.document_index_state(id).await.unwrap().semantic, "ready");
     task.abort();
 }
+
+#[tokio::test]
+async fn semantic_metadata_reads_scale_with_documents_not_chunks() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, _offline, task) = mock().await;
+    let db = open(temp.path(), &url).await;
+    db.create_directory("/manuals", None, false).await.unwrap();
+    let body = "Use the backup to recover the server.\n".repeat(80);
+    let id = db
+        .create_file_in_directory("/manuals", "recovery", &body)
+        .await
+        .unwrap();
+    db.reindex_kind(None, SearchKind::Semantic).await.unwrap();
+    let candidates = db
+        .semantic
+        .as_ref()
+        .unwrap()
+        .candidates("recover", Some("/manuals"), None)
+        .await
+        .unwrap();
+    assert!(candidates.len() > 20, "fixture must exercise many chunks");
+    assert!(candidates.iter().all(|c| c.id == id.raw()));
+
+    db.storage.metadata_reads.store(0, Ordering::Relaxed);
+    let report = db
+        .search_report(
+            "recover",
+            Some("/manuals"),
+            1,
+            None,
+            SearchKind::Semantic,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.hits().len(), 1);
+    assert_eq!(report.hits()[0].document_id(), id);
+    assert!(body.contains(report.hits()[0].snippet()));
+    // One candidate metadata read per document, plus three fresh source
+    // validation reads: before/after the body and immediately before emission.
+    assert_eq!(db.storage.metadata_reads.load(Ordering::Relaxed), 4);
+
+    // A new request must not reuse metadata from the previous request.
+    db.storage
+        .update_file(id, "apple cake recipe")
+        .await
+        .unwrap();
+    db.storage.metadata_reads.store(0, Ordering::Relaxed);
+    let stale = db
+        .search_report(
+            "recover",
+            Some("/manuals"),
+            1,
+            None,
+            SearchKind::Semantic,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(stale.hits().is_empty(), "stale revision must not escape");
+    assert_eq!(db.storage.metadata_reads.load(Ordering::Relaxed), 1);
+
+    // Missing source documents are cached too, without returning orphan chunks.
+    db.storage.delete_file(id).await.unwrap();
+    db.storage.metadata_reads.store(0, Ordering::Relaxed);
+    let deleted = db
+        .search_report(
+            "recover",
+            Some("/manuals"),
+            1,
+            None,
+            SearchKind::Semantic,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(deleted.hits().is_empty());
+    assert_eq!(db.storage.metadata_reads.load(Ordering::Relaxed), 1);
+    task.abort();
+}
