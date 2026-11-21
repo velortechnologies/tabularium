@@ -61,7 +61,14 @@ tag:
     git push origin --tags
 
 # Block the entire release before builds or publishing on any audit finding.
-release: audit deb pub-deb pub-docker tag publush-cargo-crate
+release:
+    rci x tabularium
+
+# CI entry point; never call the RCI launcher recursively.
+do-release: release-preflight audit deb pub-deb pub-docker tag publush-cargo-crate
+
+release-preflight:
+    bash scripts/release-preflight.sh
 
 # Warnings (unmaintained, unsound, yanked, etc.) are release blockers too.
 audit:
@@ -123,13 +130,10 @@ deb-arm64: build-ui
 # Both architectures (sequential).
 deb: deb-amd64 deb-arm64
 
-# Publish built .debs into local apt repo (~/src/apt/repo); requires reprepro + prior `just deb`.
+# Publish built .debs, commit all APT changes and push before bucket publication.
+# APT_REPO defaults to the sibling velor-apt checkout.
 pub-deb:
-    cd ~/src/velor-apt/repo && reprepro includedeb stable ~/src/tabularium/make-deb/dist/tabularium-cli_{{ VERSION }}_arm64.deb
-    cd ~/src/velor-apt/repo && reprepro includedeb stable ~/src/tabularium/make-deb/dist/tabularium-server_{{ VERSION }}_arm64.deb
-    cd ~/src/velor-apt/repo && reprepro includedeb stable ~/src/tabularium/make-deb/dist/tabularium-cli_{{ VERSION }}_amd64.deb
-    cd ~/src/velor-apt/repo && reprepro includedeb stable ~/src/tabularium/make-deb/dist/tabularium-server_{{ VERSION }}_amd64.deb
-    cd ~/src/velor-apt/repo && just pub
+    bash scripts/publish-deb.sh "{{VERSION}}"
 
 # On x86_64 Linux: same artifacts without Docker/cross.
 deb-native-amd64: build-ui

@@ -1,0 +1,30 @@
+git:
+  url: https://github.com/velortechnologies/tabularium
+  branch: main
+secret: null
+commands:
+  build: |
+    set -euo pipefail
+    export PATH="$HOME/.cargo/bin:$PATH"
+    export NVM_DIR="$HOME/.nvm"
+    . "$NVM_DIR/nvm.sh"
+    nvm install 22
+    nvm use 22
+    just release-preflight
+    just build-ui
+  test: |
+    set -euo pipefail
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo test --workspace --release
+  release: |
+    set -euo pipefail
+    export PATH="$HOME/.cargo/bin:$PATH"
+    export NVM_DIR="$HOME/.nvm"
+    . "$NVM_DIR/nvm.sh"
+    nvm use 22
+    just do-release
+on:
+  success: null
+  fail: null
+timeout: 14400
+enabled: true
