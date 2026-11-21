@@ -37,3 +37,9 @@ Clippy (Enginseer script on `PATH`): `just clippy` or invoke `clippy` directly.
 Remote integration rite: **`just ci-test`** — rsync to `/opt/tabularium` on **root@10.90.1.71**, release build, ephemeral `tabularium-server` (listen `0.0.0.0:<port>`) + pytest with **`TABULARIUM_TEST_URL=http://10.90.1.71:<port>`** (required for Selenium), then **`just test`**. Override `CI_HOST`, `CI_PROJECT`, `CI_LISTEN`. See [scripts/ci-test.sh](scripts/ci-test.sh).
 
 Local release-only (no SSH / no Python): `just test-ci`.
+
+## Releases
+
+All releases must run only via RCI: use `just release` or `rci x tabularium`.
+Do not publish releases manually or invoke `just do-release` outside the RCI job.
+See [docs/rci-release.md](docs/rci-release.md) for the pipeline and operational procedure.
