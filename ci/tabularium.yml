@@ -4,6 +4,7 @@ git:
 secret: null
 commands:
   build: |
+    set +x
     set -euo pipefail
     export PATH="$HOME/.cargo/bin:$PATH"
     export NVM_DIR="$HOME/.nvm"
@@ -13,10 +14,12 @@ commands:
     just release-preflight
     just build-ui
   test: |
+    set +x
     set -euo pipefail
     export PATH="$HOME/.cargo/bin:$PATH"
     cargo test --workspace --release
   release: |
+    set +x
     set -euo pipefail
     export PATH="$HOME/.cargo/bin:$PATH"
     export NVM_DIR="$HOME/.nvm"
