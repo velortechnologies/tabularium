@@ -2,30 +2,30 @@ class Tabularium < Formula
   desc "AI-oriented markdown document store with CLI and HTTP server"
   homepage "https://github.com/velortechnologies/tabularium"
   license "Apache-2.0"
-  version "0.2.1"
+  version "0.2.0"
 
   on_macos do
-    url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.1/tb-v0.2.1-aarch64-apple-darwin.tar.gz"
-    sha256 "756abfd76aabdb4f6aa4f06e7314f752be6434ef85c45141faeee3ca909a1579"
+    url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.0/tb-v0.2.0-aarch64-apple-darwin.tar.gz"
+    sha256 "02f4d26b9c9d6e6c789c4b3bc2e2b44e0eb831812790614642eb068de0346abc"
 
     resource "tabularium-server-bin" do
-      url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.1/tabularium-server-v0.2.1-aarch64-apple-darwin.tar.gz"
-      sha256 "c4ae02b1d0089974d6961f4899ab0057500fd754d9a8a57f95effc172c7c895c"
+      url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.0/tabularium-server-v0.2.0-aarch64-apple-darwin.tar.gz"
+      sha256 "dac6d0c3615666b30c8ac350f9041fef6fe1c81388052405d9975cd986a1e3a6"
     end
   end
 
   on_linux do
-    url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.1/tb-v0.2.1-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "559c55921fe6c1def57e4ce356150f43670bc4382a4214bd12a87bbb4d2cec06"
+    url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.0/tb-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "91998b0e7c7c46e79283d9c4fe533d91f53aae2367527689bee209e523a705ae"
 
     resource "tabularium-server-bin" do
-      url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.1/tabularium-server-v0.2.1-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0f698f591dd203027c82d48836b9b64d2d527ad0e76e88a02fcb86442c973ce8"
+      url "https://github.com/velortechnologies/tabularium/releases/download/v0.2.0/tabularium-server-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "f0a944a6a1e43d552c37c0c250d0216bd40c5aee11fc9b8a72b33e20b3816df5"
     end
   end
 
   resource "default-config" do
-    url "https://raw.githubusercontent.com/velortechnologies/tabularium/v0.2.1/config.toml.example"
+    url "https://raw.githubusercontent.com/velortechnologies/tabularium/v0.2.0/config.toml.example"
     sha256 "80f9a69158962b7423015fd956f2036dcb82de36ac4f3272f6c11063488631a4"
   end
 
