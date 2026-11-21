@@ -25,6 +25,9 @@ RUN case "$TARGETARCH" in \
     && install -m 0755 "/_build/${dir}/tabularium-server" /usr/sbin/tabularium-server \
     && install -m 0755 "/_build/${dir}/tb" /usr/bin/tb
 
+# Fail before pushing if either binary cannot load against the runtime libc.
+RUN /usr/bin/tb --version && /usr/sbin/tabularium-server --version
+
 COPY docker/config.toml /etc/tabularium/config.toml
 
 EXPOSE 3050

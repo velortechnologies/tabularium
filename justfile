@@ -31,24 +31,24 @@ prepare-docker:
       docker buildx inspect --bootstrap \
     '
 
-pub-docker: build-ui prepare-docker
+# Reuse the exact cross-built DEB binaries in the Docker runtime check.
+stage-docker: deb
+    mkdir -p docker/_build/amd64 docker/_build/arm64
+    cp target/x86_64-unknown-linux-gnu/release/tabularium-server docker/_build/amd64/tabularium-server
+    cp target/x86_64-unknown-linux-gnu/release/tb docker/_build/amd64/tb
+    cp target/aarch64-unknown-linux-gnu/release/tabularium-server docker/_build/arm64/tabularium-server
+    cp target/aarch64-unknown-linux-gnu/release/tb docker/_build/arm64/tb
+
+# Dockerfile executes both binaries on each platform before any public writes.
+check-runtime: stage-docker prepare-docker
+    docker buildx build --platform "${PLATFORMS:-linux/amd64,linux/arm64}" -f Dockerfile.publish .
+
+pub-docker: check-runtime
     bash -ec ' \
       IMAGE="${IMAGE:-velortech/tabularium}"; \
       VERSION="{{VERSION}}"; \
       TAG="${TAG:-}"; \
       PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"; \
-      \
-      rm -rf docker/_build; \
-      mkdir -p docker/_build/amd64 docker/_build/arm64; \
-      \
-      cross build --target x86_64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli; \
-      cp target/x86_64-unknown-linux-gnu/release/tabularium-server docker/_build/amd64/tabularium-server; \
-      cp target/x86_64-unknown-linux-gnu/release/tb docker/_build/amd64/tb; \
-      \
-      cross build --target aarch64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli; \
-      cp target/aarch64-unknown-linux-gnu/release/tabularium-server docker/_build/arm64/tabularium-server; \
-      cp target/aarch64-unknown-linux-gnu/release/tb docker/_build/arm64/tb; \
-      \
       if [[ -z "${TAG}" ]]; then \
         docker buildx build --platform "${PLATFORMS}" -f Dockerfile.publish -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" --push .; \
       else \
@@ -65,7 +65,7 @@ release:
     rci x tabularium
 
 # CI entry point; never call the RCI launcher recursively.
-do-release: release-preflight audit deb pub-deb pub-docker tag publush-cargo-crate
+do-release: release-preflight audit check-runtime pub-deb pub-docker tag publush-cargo-crate
 
 release-preflight:
     bash scripts/release-preflight.sh
