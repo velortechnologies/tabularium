@@ -34,10 +34,10 @@ prepare-docker:
 # Reuse the exact cross-built DEB binaries in the Docker runtime check.
 stage-docker: deb
     mkdir -p docker/_build/amd64 docker/_build/arm64
-    cp target/x86_64-unknown-linux-gnu/release/tabularium-server docker/_build/amd64/tabularium-server
-    cp target/x86_64-unknown-linux-gnu/release/tb docker/_build/amd64/tb
-    cp target/aarch64-unknown-linux-gnu/release/tabularium-server docker/_build/arm64/tabularium-server
-    cp target/aarch64-unknown-linux-gnu/release/tb docker/_build/arm64/tb
+    cp target/cross/x86_64-unknown-linux-gnu/release/tabularium-server docker/_build/amd64/tabularium-server
+    cp target/cross/x86_64-unknown-linux-gnu/release/tb docker/_build/amd64/tb
+    cp target/cross/aarch64-unknown-linux-gnu/release/tabularium-server docker/_build/arm64/tabularium-server
+    cp target/cross/aarch64-unknown-linux-gnu/release/tb docker/_build/arm64/tb
 
 # Dockerfile executes both binaries on each platform before any public writes.
 check-runtime: stage-docker prepare-docker
@@ -120,12 +120,12 @@ ci-test:
 # Build needs https://github.com/cross-rs/cross (and Docker) when not on the target Linux arch.
 # Packing needs `dpkg-deb` (run on Debian/Ubuntu or a container even if cross ran elsewhere).
 deb-amd64: build-ui
-    cross build --target x86_64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli
-    env TARGET_DIR=target RUST_TARGET=x86_64-unknown-linux-gnu DEB_ARCH=amd64 bash make-deb/build.sh
+    env CARGO_TARGET_DIR=target/cross cross build --target x86_64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli
+    env TARGET_DIR=target/cross RUST_TARGET=x86_64-unknown-linux-gnu DEB_ARCH=amd64 bash make-deb/build.sh
 
 deb-arm64: build-ui
-    cross build --target aarch64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli
-    env TARGET_DIR=target RUST_TARGET=aarch64-unknown-linux-gnu DEB_ARCH=arm64 bash make-deb/build.sh
+    env CARGO_TARGET_DIR=target/cross cross build --target aarch64-unknown-linux-gnu --release --features mcp -p tabularium-server -p tabularium-cli
+    env TARGET_DIR=target/cross RUST_TARGET=aarch64-unknown-linux-gnu DEB_ARCH=arm64 bash make-deb/build.sh
 
 # Both architectures (sequential).
 deb: deb-amd64 deb-arm64
