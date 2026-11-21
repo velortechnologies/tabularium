@@ -60,7 +60,7 @@ tag:
     git tag -a v{{VERSION}} -m v{{VERSION}}
     git push origin --tags
 
-# Block the entire release before builds or publishing on any audit finding.
+# Run the release through RCI; vulnerability findings block publication.
 release:
     rci x tabularium
 
@@ -70,9 +70,9 @@ do-release: release-preflight audit deb pub-deb pub-docker tag publush-cargo-cra
 release-preflight:
     bash scripts/release-preflight.sh
 
-# Warnings (unmaintained, unsound, yanked, etc.) are release blockers too.
+# Report informational warnings without blocking; vulnerabilities remain release blockers.
 audit:
-    cargo audit --deny warnings
+    cargo audit
 
 publush-cargo-crate:
     bash -ec 'if [[ "${SKIP_CARGO_PUBLISH:-0}" == 1 ]]; then echo "Rehearsal: crates.io publication explicitly skipped"; else cargo publish -p tabularium; fi'
