@@ -75,7 +75,7 @@ audit:
     cargo audit --deny warnings
 
 publush-cargo-crate:
-    cargo publish -p tabularium
+    bash -ec 'if [[ "${SKIP_CARGO_PUBLISH:-0}" == 1 ]]; then echo "Rehearsal: crates.io publication explicitly skipped"; else cargo publish -p tabularium; fi'
 
 # Patch-bump [workspace.package] version, then cargo check --workspace (refresh lock/metadata).
 bump:
